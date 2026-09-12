@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
+
+import torch
 
 
 BYTE_VOCABULARY_SIZE = 256
@@ -14,10 +16,9 @@ class ModelSettings:
     embedding_size: int = 64
     memory_features: int = 16
     local_memory_size: int = 16
-    deep_steps: int = 2
-    active_specialists: int = 2
-    risk_threshold: float = 0.65
-    exploration_interval: int = 0
+    expert_count: int = 0
+    cache_capacity: int = 256
+    scan_chunk: int = 128
 
     def __post_init__(self) -> None:
         if self.vocabulary_size != BYTE_VOCABULARY_SIZE + 1:
@@ -28,14 +29,12 @@ class ModelSettings:
             raise ValueError("memory_features must be at least 2")
         if self.local_memory_size < 1:
             raise ValueError("local_memory_size must be at least 1")
-        if self.deep_steps < 1:
-            raise ValueError("deep_steps must be at least 1")
-        if not 1 <= self.active_specialists <= 5:
-            raise ValueError("active_specialists must be between 1 and 5")
-        if not 0.0 <= self.risk_threshold <= 1.0:
-            raise ValueError("risk_threshold must be between 0 and 1")
-        if self.exploration_interval < 0:
-            raise ValueError("exploration_interval must be non-negative")
+        if self.scan_chunk < 1:
+            raise ValueError("scan_chunk must be at least 1")
+        if not 0 <= self.expert_count <= 64:
+            raise ValueError("expert_count must be between 0 and 64")
+        if self.cache_capacity < 1:
+            raise ValueError("cache_capacity must be at least 1")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -46,39 +45,19 @@ class ModelSettings:
 
 
 @dataclass(frozen=True)
-class RouterSettings:
-    hard_margin: float = 0.05
-    router_loss_weight: float = 1.0
-    compute_penalty_weight: float = 0.05
-    balance_loss_weight: float = 0.01
-    decision_threshold: float = 0.65
-
-    def __post_init__(self) -> None:
-        if self.hard_margin < 0.0:
-            raise ValueError("hard_margin must be non-negative")
-        if self.router_loss_weight < 0.0:
-            raise ValueError("router_loss_weight must be non-negative")
-        if self.compute_penalty_weight < 0.0:
-            raise ValueError("compute_penalty_weight must be non-negative")
-        if self.balance_loss_weight < 0.0:
-            raise ValueError("balance_loss_weight must be non-negative")
-        if not 0.0 <= self.decision_threshold <= 1.0:
-            raise ValueError("decision_threshold must be between 0 and 1")
-
-
-@dataclass(frozen=True)
 class TrainingSettings:
     sequence_length: int = 128
     batch_size: int = 4
     epochs: int = 3
     learning_rate: float = 0.001
     gradient_clip_norm: float = 1.0
-    device: str = "cpu"
-    routing_mode: str = "calibration"
+    device: str = field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
+    execution_mode: str = "parallel"
+    thinking_loss_weight: float = 1.0
 
     def __post_init__(self) -> None:
-        if self.routing_mode not in {"calibration", "hard"}:
-            raise ValueError("routing_mode must be 'calibration' or 'hard'")
+        if self.execution_mode not in {"parallel", "sequential"}:
+            raise ValueError("execution_mode must be 'parallel' or 'sequential'")
         if self.sequence_length < 2:
             raise ValueError("sequence_length must be at least 2")
         if self.batch_size < 1:
@@ -89,6 +68,8 @@ class TrainingSettings:
             raise ValueError("learning_rate must be positive")
         if self.gradient_clip_norm <= 0.0:
             raise ValueError("gradient_clip_norm must be positive")
+        if self.thinking_loss_weight < 0.0:
+            raise ValueError("thinking_loss_weight must be non-negative")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

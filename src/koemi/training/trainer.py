@@ -8,34 +8,23 @@ import torch
 from torch import Tensor, nn
 from torch.utils.data import DataLoader
 
-from koemi.configuration.settings import RouterSettings, TrainingSettings
-from koemi.model.network import KoemiModel
-from koemi.model.router import SPECIALIST_COUNT, RoutingMode
+from koemi.configuration.settings import TrainingSettings
+from koemi.model.execution import ExecutionMode
+from koemi.model.network import KoemiModel, KoemiOutput
 from koemi.training.dataset import IGNORE_TARGET_ID
-from koemi.training.routing import calculate_router_objective
+from koemi.training.objective import TrainingObjective, calculate_training_objective
 
 
 @dataclass(frozen=True)
 class TrainingResult:
     mean_loss: float
     mean_task_loss: float
-    mean_deep_loss: float
-    mean_fast_loss: float
-    mean_router_loss: float
-    router_accuracy: float
-    hard_token_fraction: float
-    mean_risk: float
+    mean_thinking_loss: float
+    mean_surprise: float
     supervised_token_count: int
     token_count: int
-    deep_token_count: int
-    specialist_activation_counts: tuple[int, ...]
+    expert_activation_counts: tuple[int, ...]
     elapsed_seconds: float
-
-    @property
-    def deep_token_fraction(self) -> float:
-        if self.token_count == 0:
-            return 0.0
-        return self.deep_token_count / self.token_count
 
 
 class Trainer:
@@ -47,10 +36,8 @@ class Trainer:
         model: KoemiModel,
         loader: DataLoader[dict[str, Tensor]],
         settings: TrainingSettings,
-        router_settings: RouterSettings | None = None,
     ) -> TrainingResult:
-        active_router_settings = router_settings or RouterSettings(decision_threshold=model.settings.risk_threshold)
-        routing_mode = RoutingMode(settings.routing_mode)
+        execution_mode = ExecutionMode(settings.execution_mode)
         model.to(settings.device)
         model.train()
         optimizer = torch.optim.AdamW(model.parameters(), lr=settings.learning_rate)
@@ -61,12 +48,15 @@ class Trainer:
             for batch in loader:
                 input_ids = batch["input_ids"].to(settings.device)
                 target_ids = batch["target_ids"].to(settings.device)
+                thinking_mask = batch["thinking_mask"].to(settings.device)
                 supervised_count = int((target_ids != IGNORE_TARGET_ID).sum().item())
                 if supervised_count == 0:
                     continue
                 optimizer.zero_grad(set_to_none=True)
-                output = model(input_ids, routing_mode=routing_mode)
-                objective = calculate_router_objective(output, target_ids, active_router_settings)
+                output = model(input_ids, execution_mode=execution_mode)
+                objective = calculate_training_objective(
+                    output, target_ids, thinking_mask, settings.thinking_loss_weight
+                )
                 objective.total_loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), settings.gradient_clip_norm)
                 optimizer.step()
@@ -74,24 +64,16 @@ class Trainer:
             if epoch_metrics.supervised_token_count == 0:
                 raise ValueError("training loader produced no supervised tokens")
             self.logger.info(
-                "epoch_completed epoch=%s loss=%.6f task_loss=%.6f deep_loss=%.6f fast_loss=%.6f "
-                "router_loss=%.6f router_accuracy=%.4f "
-                "hard_fraction=%.4f mean_risk=%.4f supervised_tokens=%s tokens=%s deep_tokens=%s deep_fraction=%.4f "
-                "specialist_activations=%s",
+                "epoch_completed epoch=%s loss=%.6f task_loss=%.6f thinking_loss=%.6f surprise=%.4f "
+                "supervised_tokens=%s tokens=%s expert_activations=%s",
                 epoch_index,
                 epoch_metrics.mean_loss,
                 epoch_metrics.mean_task_loss,
-                epoch_metrics.mean_deep_loss,
-                epoch_metrics.mean_fast_loss,
-                epoch_metrics.mean_router_loss,
-                epoch_metrics.router_accuracy,
-                epoch_metrics.hard_fraction,
-                epoch_metrics.mean_risk,
+                epoch_metrics.mean_thinking_loss,
+                epoch_metrics.mean_surprise,
                 epoch_metrics.supervised_token_count,
                 epoch_metrics.token_count,
-                epoch_metrics.deep_token_count,
-                epoch_metrics.deep_token_fraction,
-                epoch_metrics.specialist_activation_counts,
+                epoch_metrics.expert_activation_counts,
             )
             accumulator.merge(epoch_metrics)
         return accumulator.to_result(time.perf_counter() - start_time)
@@ -101,46 +83,35 @@ class MetricAccumulator:
     def __init__(self) -> None:
         self.weighted_loss = 0.0
         self.weighted_task_loss = 0.0
-        self.weighted_deep_loss = 0.0
-        self.weighted_fast_loss = 0.0
-        self.weighted_router_loss = 0.0
-        self.weighted_router_accuracy = 0.0
-        self.weighted_hard_fraction = 0.0
-        self.weighted_risk = 0.0
+        self.weighted_thinking_loss = 0.0
+        self.surprise_total = 0.0
         self.supervised_token_count = 0
         self.token_count = 0
-        self.deep_token_count = 0
-        self.specialist_activation_counts = [0] * SPECIALIST_COUNT
+        self.expert_activation_counts: list[int] = []
 
-    def add(self, output, objective, supervised_count: int) -> None:
+    def add(self, output: KoemiOutput, objective: TrainingObjective, supervised_count: int) -> None:
         self.weighted_loss += float(objective.total_loss.detach()) * supervised_count
         self.weighted_task_loss += float(objective.task_loss.detach()) * supervised_count
-        self.weighted_deep_loss += float(objective.deep_loss.detach()) * supervised_count
-        self.weighted_fast_loss += float(objective.fast_loss.detach()) * supervised_count
-        self.weighted_router_loss += float(objective.router_loss.detach()) * supervised_count
-        self.weighted_router_accuracy += objective.router_accuracy * supervised_count
-        self.weighted_hard_fraction += objective.hard_fraction * supervised_count
-        self.weighted_risk += objective.mean_risk * supervised_count
+        self.weighted_thinking_loss += float(objective.thinking_loss.detach()) * supervised_count
+        self.surprise_total += float(output.surprise_values.masked_select(output.valid_positions).sum().detach())
         self.supervised_token_count += supervised_count
         self.token_count += output.token_count
-        self.deep_token_count += output.deep_token_count
-        for index, count in enumerate(output.specialist_activation_counts):
-            self.specialist_activation_counts[index] += count
+        self.accumulate_expert_activations(output.expert_activation_counts)
+
+    def accumulate_expert_activations(self, counts: tuple[int, ...]) -> None:
+        if len(self.expert_activation_counts) < len(counts):
+            self.expert_activation_counts.extend([0] * (len(counts) - len(self.expert_activation_counts)))
+        for index, count in enumerate(counts):
+            self.expert_activation_counts[index] += count
 
     def merge(self, other: MetricAccumulator) -> None:
         self.weighted_loss += other.weighted_loss
         self.weighted_task_loss += other.weighted_task_loss
-        self.weighted_deep_loss += other.weighted_deep_loss
-        self.weighted_fast_loss += other.weighted_fast_loss
-        self.weighted_router_loss += other.weighted_router_loss
-        self.weighted_router_accuracy += other.weighted_router_accuracy
-        self.weighted_hard_fraction += other.weighted_hard_fraction
-        self.weighted_risk += other.weighted_risk
+        self.weighted_thinking_loss += other.weighted_thinking_loss
+        self.surprise_total += other.surprise_total
         self.supervised_token_count += other.supervised_token_count
         self.token_count += other.token_count
-        self.deep_token_count += other.deep_token_count
-        for index, count in enumerate(other.specialist_activation_counts):
-            self.specialist_activation_counts[index] += count
+        self.accumulate_expert_activations(tuple(other.expert_activation_counts))
 
     def average(self, weighted_value: float) -> float:
         if self.supervised_token_count == 0:
@@ -156,48 +127,23 @@ class MetricAccumulator:
         return self.average(self.weighted_task_loss)
 
     @property
-    def mean_deep_loss(self) -> float:
-        return self.average(self.weighted_deep_loss)
+    def mean_thinking_loss(self) -> float:
+        return self.average(self.weighted_thinking_loss)
 
     @property
-    def mean_fast_loss(self) -> float:
-        return self.average(self.weighted_fast_loss)
-
-    @property
-    def mean_router_loss(self) -> float:
-        return self.average(self.weighted_router_loss)
-
-    @property
-    def router_accuracy(self) -> float:
-        return self.average(self.weighted_router_accuracy)
-
-    @property
-    def hard_fraction(self) -> float:
-        return self.average(self.weighted_hard_fraction)
-
-    @property
-    def mean_risk(self) -> float:
-        return self.average(self.weighted_risk)
-
-    @property
-    def deep_token_fraction(self) -> float:
+    def mean_surprise(self) -> float:
         if self.token_count == 0:
             return 0.0
-        return self.deep_token_count / self.token_count
+        return self.surprise_total / self.token_count
 
     def to_result(self, elapsed_seconds: float) -> TrainingResult:
         return TrainingResult(
             mean_loss=self.mean_loss,
             mean_task_loss=self.mean_task_loss,
-            mean_deep_loss=self.mean_deep_loss,
-            mean_fast_loss=self.mean_fast_loss,
-            mean_router_loss=self.mean_router_loss,
-            router_accuracy=self.router_accuracy,
-            hard_token_fraction=self.hard_fraction,
-            mean_risk=self.mean_risk,
+            mean_thinking_loss=self.mean_thinking_loss,
+            mean_surprise=self.mean_surprise,
             supervised_token_count=self.supervised_token_count,
             token_count=self.token_count,
-            deep_token_count=self.deep_token_count,
-            specialist_activation_counts=tuple(self.specialist_activation_counts),
+            expert_activation_counts=tuple(self.expert_activation_counts),
             elapsed_seconds=elapsed_seconds,
         )

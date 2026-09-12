@@ -3,12 +3,16 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 from typing import Sequence
 
-from koemi.configuration.settings import ModelSettings, RouterSettings, TrainingSettings
+import torch
+
+from koemi.configuration.settings import ModelSettings, TrainingSettings
 from koemi.data.adapters import SUPPORTED_DATASET_FORMATS
 from koemi.data.readers import DatasetLoadReport, load_dataset_records
 from koemi.data.tokenizer import ByteTokenizer
+from koemi.model.cache import DiskMappingCache, WarmTokenCache
 from koemi.model.network import KoemiModel
 from koemi.observability.logging import configure_logging
 from koemi.training.checkpoints import CheckpointStore
@@ -36,14 +40,14 @@ def main(arguments: Sequence[str] | None = None) -> int:
 
 
 def create_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="koemi", description="Koemi-1FPA byte-level recurrent model")
+    parser = argparse.ArgumentParser(prog="koemi", description="Koemi-2OBOV byte-level recurrent training base")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     inspect_parser = subparsers.add_parser("inspect-dataset", help="Validate and summarize JSON datasets")
     add_dataset_arguments(inspect_parser)
 
-    train_parser = subparsers.add_parser("train", help="Train a Koemi checkpoint from JSON datasets")
+    train_parser = subparsers.add_parser("train", help="Train a Koemi-2OBOV checkpoint from JSON datasets")
     add_dataset_arguments(train_parser)
     train_parser.add_argument("--checkpoint", required=True, help="Output checkpoint path")
     train_parser.add_argument("--overwrite", action="store_true", help="Replace an existing checkpoint")
@@ -52,20 +56,21 @@ def create_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--epochs", type=int, default=3)
     train_parser.add_argument("--learning-rate", type=float, default=0.001)
     train_parser.add_argument("--gradient-clip-norm", type=float, default=1.0)
-    train_parser.add_argument("--device", default="cpu")
-    train_parser.add_argument("--routing-mode", choices=("calibration", "hard"), default="calibration")
-    train_parser.add_argument("--hard-margin", type=float, default=0.05)
-    train_parser.add_argument("--router-loss-weight", type=float, default=1.0)
-    train_parser.add_argument("--compute-penalty-weight", type=float, default=0.05)
-    train_parser.add_argument("--balance-loss-weight", type=float, default=0.01)
+    train_parser.add_argument("--device", default=None, help="Training device, defaulting to CUDA when available")
+    train_parser.add_argument("--execution-mode", choices=("parallel", "sequential"), default="parallel")
+    train_parser.add_argument("--thinking-loss-weight", type=float, default=1.0)
     add_model_arguments(train_parser)
 
-    generate_parser = subparsers.add_parser("generate", help="Generate text from a Koemi checkpoint")
+    generate_parser = subparsers.add_parser("generate", help="Generate text from a Koemi-2OBOV checkpoint")
     generate_parser.add_argument("--checkpoint", required=True, help="Checkpoint path")
     generate_parser.add_argument("--prompt", required=True, help="Text used to start generation")
     generate_parser.add_argument("--max-new-bytes", type=int, default=128)
     generate_parser.add_argument("--temperature", type=float, default=1.0)
     generate_parser.add_argument("--device", default="cpu")
+    generate_parser.add_argument("--cache-capacity", type=int, default=None)
+    generate_parser.add_argument("--mapping-cache", default=None, help="Optional SSD directory for exact inference mappings")
+    generate_parser.add_argument("--mapping-cache-capacity", type=int, default=128)
+    generate_parser.add_argument("--mapping-cache-max-entry-mib", type=int, default=64)
     return parser
 
 
@@ -78,10 +83,9 @@ def add_model_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--embedding-size", type=int, default=64)
     parser.add_argument("--memory-features", type=int, default=16)
     parser.add_argument("--local-memory-size", type=int, default=16)
-    parser.add_argument("--deep-steps", type=int, default=2)
-    parser.add_argument("--active-specialists", type=int, default=2)
-    parser.add_argument("--risk-threshold", type=float, default=0.65)
-    parser.add_argument("--exploration-interval", type=int, default=0)
+    parser.add_argument("--expert-count", type=int, default=0)
+    parser.add_argument("--cache-capacity", type=int, default=256)
+    parser.add_argument("--scan-chunk", type=int, default=128)
 
 
 def inspect_dataset(arguments: argparse.Namespace, logger) -> int:
@@ -104,40 +108,26 @@ def train_model(arguments: argparse.Namespace, logger) -> int:
         epochs=arguments.epochs,
         learning_rate=arguments.learning_rate,
         gradient_clip_norm=arguments.gradient_clip_norm,
-        device=arguments.device,
-        routing_mode=arguments.routing_mode,
-    )
-    router_settings = RouterSettings(
-        hard_margin=arguments.hard_margin,
-        router_loss_weight=arguments.router_loss_weight,
-        compute_penalty_weight=arguments.compute_penalty_weight,
-        balance_loss_weight=arguments.balance_loss_weight,
-        decision_threshold=model_settings.risk_threshold,
+        device=arguments.device or ("cuda" if torch.cuda.is_available() else "cpu"),
+        execution_mode=arguments.execution_mode,
+        thinking_loss_weight=arguments.thinking_loss_weight,
     )
     dataset = CausalByteDataset(report.records, training_settings.sequence_length)
     loader = create_training_loader(dataset, training_settings.batch_size)
     model = KoemiModel(model_settings)
-    result = Trainer(logger).train(model, loader, training_settings, router_settings)
+    result = Trainer(logger).train(model, loader, training_settings)
     checkpoint_path = CheckpointStore().save(arguments.checkpoint, model, overwrite=arguments.overwrite)
     logger.info(
-        "training_completed checkpoint=%s mean_loss=%.6f task_loss=%.6f deep_loss=%.6f fast_loss=%.6f "
-        "router_loss=%.6f router_accuracy=%.4f "
-        "hard_fraction=%.4f mean_risk=%.4f supervised_tokens=%s tokens=%s deep_tokens=%s deep_fraction=%.4f "
-        "specialist_activations=%s elapsed_seconds=%.3f",
+        "training_completed checkpoint=%s mean_loss=%.6f task_loss=%.6f thinking_loss=%.6f "
+        "mean_surprise=%.4f supervised_tokens=%s tokens=%s expert_activations=%s elapsed_seconds=%.3f",
         checkpoint_path,
         result.mean_loss,
         result.mean_task_loss,
-        result.mean_deep_loss,
-        result.mean_fast_loss,
-        result.mean_router_loss,
-        result.router_accuracy,
-        result.hard_token_fraction,
-        result.mean_risk,
+        result.mean_thinking_loss,
+        result.mean_surprise,
         result.supervised_token_count,
         result.token_count,
-        result.deep_token_count,
-        result.deep_token_fraction,
-        result.specialist_activation_counts,
+        result.expert_activation_counts,
         result.elapsed_seconds,
     )
     return 0
@@ -145,6 +135,18 @@ def train_model(arguments: argparse.Namespace, logger) -> int:
 
 def generate_completion(arguments: argparse.Namespace, logger) -> int:
     loaded_checkpoint = CheckpointStore().load(arguments.checkpoint, arguments.device)
+    cache_capacity = arguments.cache_capacity or loaded_checkpoint.model_settings.cache_capacity
+    warm_cache = WarmTokenCache(cache_capacity)
+    mapping_cache = (
+        DiskMappingCache(
+            arguments.mapping_cache,
+            arguments.mapping_cache_capacity,
+            checkpoint_namespace(arguments.checkpoint),
+            arguments.mapping_cache_max_entry_mib * 1024 * 1024,
+        )
+        if arguments.mapping_cache is not None
+        else None
+    )
     completion = generate_text(
         loaded_checkpoint.model,
         ByteTokenizer(),
@@ -152,8 +154,22 @@ def generate_completion(arguments: argparse.Namespace, logger) -> int:
         arguments.max_new_bytes,
         arguments.temperature,
         arguments.device,
+        warm_cache,
+        mapping_cache,
     )
-    logger.info("generation_completed generated_bytes=%s", len(completion.encode("utf-8")))
+    statistics = warm_cache.statistics()
+    mapping_statistics = mapping_cache.statistics() if mapping_cache is not None else None
+    logger.info(
+        "generation_completed generated_bytes=%s cache_hits=%s cache_misses=%s cache_evictions=%s "
+        "mapping_hits=%s mapping_misses=%s mapping_evictions=%s",
+        len(completion.encode("utf-8")),
+        statistics.hits,
+        statistics.misses,
+        statistics.evictions,
+        mapping_statistics.hits if mapping_statistics else 0,
+        mapping_statistics.misses if mapping_statistics else 0,
+        mapping_statistics.evictions if mapping_statistics else 0,
+    )
     write_utf8(completion)
     return 0
 
@@ -174,10 +190,9 @@ def create_model_settings(arguments: argparse.Namespace) -> ModelSettings:
         embedding_size=arguments.embedding_size,
         memory_features=arguments.memory_features,
         local_memory_size=arguments.local_memory_size,
-        deep_steps=arguments.deep_steps,
-        active_specialists=arguments.active_specialists,
-        risk_threshold=arguments.risk_threshold,
-        exploration_interval=arguments.exploration_interval,
+        expert_count=arguments.expert_count,
+        cache_capacity=arguments.cache_capacity,
+        scan_chunk=arguments.scan_chunk,
     )
 
 
@@ -190,3 +205,9 @@ def write_utf8(value: str) -> None:
         return
     stdout_buffer.write(encoded_value)
     stdout_buffer.flush()
+
+
+def checkpoint_namespace(checkpoint_path: str) -> str:
+    resolved_path = Path(checkpoint_path).expanduser().resolve()
+    file_stat = resolved_path.stat()
+    return f"{resolved_path}:{file_stat.st_size}:{file_stat.st_mtime_ns}"

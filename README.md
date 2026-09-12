@@ -1,22 +1,21 @@
-# Koemi-1FPA
+# Koemi-2OBOV
 
-[![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.8%2B-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
-[![Input](https://img.shields.io/badge/input-JSON%20and%20JSONL-4B8BBE)](#dataset-contract)
+Koemi-2OBOV is a PyTorch training base for byte-level causal models built on
+KSM (Koemi State Memory): bounded recurrent state, associative memory, local
+exact recall and optional fixed-dispatch experts.
 
-Koemi-1FPA is a CPU-first PyTorch reference model exploring recurrent state, associative memory, and per-token adaptive compute for byte-level language modeling. Research MVP with a CLI for training and generation.
+This repository contains architecture and training code. It does not ship a
+trained model and does not claim Transformer-level quality.
 
-`1FPA` stands for First Prototype Architecture. It is the first of a series, and the number is there so a later architecture can break its contracts without renaming the project.
+## Problem
 
-## What it is for
-
-Adaptive-compute claims are easy to state and hard to verify. A router that sends hard tokens through an expensive path and easy tokens through a cheap one only saves compute if someone measures which tokens the deep path actually helps. Koemi exists to make that measurable on a laptop: the router is trained against a label derived from the loss difference between the two paths, and the benchmark reports the deep-path fraction next to loss, throughput, and state size.
-
-The code is a research MVP. It is not a production model and it does not claim Transformer-level quality.
+Large attention models spend memory and compute repeatedly processing context.
+KSM keeps a bounded state for the running sequence, a small exact local buffer,
+and an associative state that can be updated with a parallel affine scan.
 
 ## Install
 
-Requirements: Python 3.11 or newer, and pip.
+Requirements: Python 3.11 or newer and pip.
 
 ```bash
 python -m venv .venv
@@ -28,32 +27,25 @@ On Windows, replace `.venv/bin/python` with `.venv\Scripts\python`.
 
 ## Dataset contract
 
-The core accepts `.json` arrays and `.jsonl` files. Each normalized record uses this shape:
+The loader accepts `.json` arrays and `.jsonl` files. A normalized record uses
+this shape:
 
 ```json
 {
   "id": "queue-001",
   "input": "Explain FIFO in one sentence.",
-  "thinking": null,
+  "thinking": "A queue preserves arrival order.",
   "output": "FIFO means first in, first out.",
-  "metadata": {
-    "source": "example"
-  }
+  "metadata": {"source": "example"}
 }
 ```
 
-`thinking` is optional. Records without it train as ordinary causal language-model examples. When it is present, its bytes are included as supervised targets before `output`.
+`thinking` is optional. Its bytes receive a separate target mask and can be
+weighted with `--thinking-loss-weight`. The mask does not claim that visible
+thinking text is an internal reasoning trace.
 
-For plain text, set `output` to `null`. The complete `input` field becomes the training sequence.
-
-The loader also recognizes these source layouts through explicit adapters:
-
-- Alpaca: `instruction`, `input`, `output`
-- ShareGPT: `conversations` with `human` or `user`, and `gpt` or `assistant`
-
-The core does not infer arbitrary JSON field meanings. Invalid types, unsupported suffixes, malformed JSON, and files larger than 64 MiB fail with an error.
-
-Inspect a dataset before training:
+For plain text, set `output` to `null`; the complete `input` becomes the causal
+training sequence. Alpaca and ShareGPT records enter through validated adapters.
 
 ```bash
 .venv/bin/python -m koemi inspect-dataset --dataset examples/canonical.jsonl
@@ -61,146 +53,141 @@ Inspect a dataset before training:
 
 ## Train
 
+The default model has no expert bank, which is the lowest-cost path. CUDA is
+selected by the CLI when available; use `--device cpu` for deterministic local
+verification.
+
 ```bash
-.venv/bin/python -m koemi train --dataset examples/canonical.jsonl --checkpoint artifacts/koemi-1fpa.pt --overwrite --epochs 2 --embedding-size 32 --memory-features 8 --local-memory-size 8 --deep-steps 1 --active-specialists 1
+.venv/bin/python -m koemi train \
+  --dataset examples/canonical.jsonl \
+  --checkpoint artifacts/koemi-2obov.pt \
+  --overwrite \
+  --expert-count 2 \
+  --thinking-loss-weight 2.0
 ```
 
-Training runs in `calibration` mode by default. Every valid token goes through both the fast path and the deep path, and the per-token loss difference between them becomes the router's supervision label. The command logs dataset counts, task loss, fast-path loss, deep-path loss, router loss, router accuracy, hard-token fraction, mean risk, deep-route fraction, and per-specialist activation counts. It never logs example content.
-
-Pass `--routing-mode hard` to train with threshold routing instead. That mode is cheaper per step, produces no router supervision, and leaves the risk head untrained.
+Training logs contain loss, thinking loss, surprise, valid-token count and
+expert activations. Example content is never logged.
 
 ## Generate
 
 ```bash
-.venv/bin/python -m koemi generate --checkpoint artifacts/koemi-1fpa.pt --prompt "FIFO means" --max-new-bytes 64
+.venv/bin/python -m koemi generate \
+  --checkpoint artifacts/koemi-2obov.pt \
+  --prompt "FIFO means" \
+  --max-new-bytes 64 \
+  --cache-capacity 256 \
+  --mapping-cache D:\\koemi-cache
 ```
 
-Generation always uses hard routing: a token enters the deep path when its risk crosses `--risk-threshold`. The default sampler is stochastic; use `--temperature` to change sampling sharpness.
-
-## How routing works
-
-The fast path fuses the recurrent state, the associative memory read, and the local memory read, then reads out a next-byte distribution. Three observables come out of that step:
-
-- `uncertainty` — normalized entropy of the fast distribution
-- `conflict` — normalized distance between the recurrent state and the memory read
-- `novelty` — one minus the highest cosine similarity against the local key buffer
-
-The risk head is a linear map over those three observables plus the fused context, followed by a sigmoid. It is trained, not hand-weighted. During calibration the trainer computes the per-token cross entropy of both paths, labels a token `hard` when the deep path lowers the loss by more than `--hard-margin`, and fits the risk head with binary cross entropy against that label. A compute penalty on mean risk pulls in the other direction, so the router pays for the compute it asks for.
-
-Specialist selection is separate. `--active-specialists` paths are chosen by top-k over a routing projection, mixed by a softmax over the selected scores, and a Switch-style load-balance penalty discourages collapse onto one path. The five paths share one class and one set of hyperparameters. They are numbered, not named, because nothing in the objective binds a path to a role; per-specialist activation counts are logged so specialization can be checked rather than assumed.
-
-## Configuration
-
-Model options, used by `train` and stored in the checkpoint:
-
-| Option | Default | Effect |
-| --- | ---: | --- |
-| `--embedding-size` | `64` | Width of the recurrent state and token embedding. |
-| `--memory-features` | `16` | Width of the associative memory features. |
-| `--local-memory-size` | `16` | Number of exact local key-value entries. |
-| `--deep-steps` | `2` | Internal updates per selected specialist. |
-| `--active-specialists` | `2` | Specialists selected for a deep token. |
-| `--risk-threshold` | `0.65` | Risk required to enter the deep path under hard routing. |
-| `--exploration-interval` | `0` | Force a deep route every N model steps; `0` disables it. |
-
-Training options:
-
-| Option | Default | Effect |
-| --- | ---: | --- |
-| `--sequence-length` | `128` | Bytes per causal chunk. |
-| `--batch-size` | `4` | Chunks per optimizer step. |
-| `--epochs` | `3` | Passes over the dataset. |
-| `--learning-rate` | `0.001` | AdamW learning rate. |
-| `--gradient-clip-norm` | `1.0` | Global gradient norm cap. |
-| `--routing-mode` | `calibration` | `calibration` runs both paths and trains the router; `hard` routes by threshold. |
-| `--hard-margin` | `0.05` | Nats of loss improvement required to label a token `hard`. |
-| `--router-loss-weight` | `1.0` | Weight of the router's binary cross entropy. |
-| `--compute-penalty-weight` | `0.05` | Weight of the penalty on mean risk. |
-| `--balance-loss-weight` | `0.01` | Weight of the load-balance penalty over specialists. |
+The RAM cache reuses detached embeddings by token id. The optional mapping
+cache stores the output and recurrent state for an exact input sequence under a
+checkpoint namespace and content hash. It is suitable for repeated identical prompts, not semantic
+similarity. Use a dedicated SSD directory and clear it when its retention is no
+longer acceptable.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    Input[UTF-8 bytes] --> State[Bounded recurrent state]
-    State --> Memory[Associative memory]
-    State --> Local[Local key-value memory]
-    Memory --> Fast[Fast fused context]
-    Local --> Fast
-    Fast --> Preview[Next-byte preview and observables]
-    Preview --> Router{Risk head}
-    Router -->|Below threshold| Head[Token predictor]
-    Router -->|At or above threshold| Specialists[Top-k specialist paths]
-    Specialists --> Head
-    Head --> Next[Next byte distribution]
+    Input[UTF-8 bytes] --> Embedding
+    Warm[RAM token cache] -.-> Embedding
+    Disk[Optional SSD mapping cache] -. exact sequence .-> Output
+    Embedding --> Recurrent[Bounded recurrent state]
+    Recurrent --> Associative[Associative memory]
+    Recurrent --> Local[Exact local KV ring]
+    Recurrent --> Surprise[Linear causal surprise]
+    Surprise --> Associative
+    Associative --> Fusion[Linear fusion]
+    Local --> Fusion
+    Recurrent --> Fusion
+    Fusion --> MoE[Optional fixed-dispatch MoE]
+    MoE --> Output[Linear byte predictor]
 ```
 
-The associative memory keeps a fixed-size learned state with a decay gate. The local memory retains recent key-value pairs exactly within its configured window. Both are created per forward call and reset for every batch or generation request, so there is no memory that outlives a request.
+### KSM memory choices
+
+KSM uses four decisions inspired by the memory perspective in [MIRAS](https://research.google/blog/titans-miras-helping-ai-have-long-term-memory/):
+
+- memory architecture: bounded vector state, diagonal associative state and a
+  fixed local key-value ring;
+- attentional bias: key/query feature similarity and local dot-product recall;
+- retention gate: bounded decay with a learned write gate;
+- memory algorithm: differentiable outer training plus affine prefix scan.
+
+The current implementation is a research base, not a reimplementation of
+Titans. The Google overview identifies Titans as a concrete architecture and
+MIRAS as the broader framework; Titans uses a deeper online-updated neural
+memory than KSM currently does.
+
+### Surprise and chains
+
+The recurrent state creates a cheap linear preview. A scalar surprise estimate
+from that preview scales the next associative write. It does not select an
+execution path. A carried `KoemiState` is the chain between generation steps;
+resetting it starts a new session.
+
+### Fixed-dispatch MoE
+
+When `--expert-count` is greater than zero, token `id % expert_count` selects
+one expert. There is no risk head, top-k selector, routing projection or
+routing loss. This keeps work predictable and supports MoE training, but it
+does not provide learned semantic expert selection.
+
+## Configuration
+
+| Option | Default | Effect |
+| --- | ---: | --- |
+| `--embedding-size` | `64` | Width of token embeddings and recurrent state. |
+| `--memory-features` | `16` | Width of associative memory features. |
+| `--local-memory-size` | `16` | Number of exact local key-value slots. |
+| `--expert-count` | `0` | Fixed-dispatch expert count; zero disables MoE. |
+| `--cache-capacity` | `256` | Maximum RAM token embeddings. |
+| `--scan-chunk` | `128` | Sequence bucket used by the parallel path. |
+| `--thinking-loss-weight` | `1.0` | Relative weight of supervised thinking bytes. |
+| `--device` | CUDA if available | PyTorch device used for training or generation. |
+| `--execution-mode` | `parallel` | `parallel` scan or sequential correctness path. |
 
 ## Benchmark
 
-`benchmarks/run_benchmark.py` trains Koemi and two recurrent baselines on the same seeded synthetic data and reports loss, bits per byte, throughput, peak resident memory, recurrent state size, and the deep-path token fraction. Each model runs in its own process so the memory peak belongs to one model.
-
 ```bash
-.venv/bin/python benchmarks/run_benchmark.py --task bytes --report artifacts/bench-bytes.json
-.venv/bin/python benchmarks/run_benchmark.py --task recall --report artifacts/bench-recall.json
+.venv/bin/python benchmarks/run_benchmark.py --task bytes --report artifacts/bench-bytes-obov.json
+.venv/bin/python benchmarks/run_benchmark.py --task recall --report artifacts/bench-recall-obov.json
 ```
 
-The GRU and LSTM baselines are parameter-matched to Koemi by searching their hidden size, so the comparison is at equal parameter count and not equal width. The `recall` task is a key-value lookup: the sequence lists `key=value` pairs, then queries one key, and only the answer bytes are supervised. It is the cheap local stand-in for associative recall.
-
-At about 161k parameters, 48 training records, and 2 epochs on a 4-thread CPU:
-
-| Task | Model | Bits per byte | Eval tokens/s | State bytes/sequence |
-| --- | --- | ---: | ---: | ---: |
-| bytes | Koemi-1FPA | 3.653 | 466 | 7,152 |
-| bytes | GRU | 3.216 | 7,095 | 656 |
-| bytes | LSTM | 3.542 | 11,606 | 1,152 |
-| recall | Koemi-1FPA | 7.607 | 76 | 7,152 |
-| recall | GRU | 5.194 | 760 | 656 |
-| recall | LSTM | 5.240 | 1,736 | 1,152 |
-
-Koemi loses on every column. The deep path is also not earning its keep: the trained router sends 0.1% of tokens through it on `bytes` and 1.6% on `recall`, and the loss difference against the fast path there is under 0.001 nats. That is the router working correctly on a deep path that currently adds nothing.
-
-The budget is deliberately small enough to finish on a laptop, and no model solved `recall` at it, so these numbers rank optimization behavior rather than architectural ceilings. The full tables, the environment, the caveats, and the next measurements are in [`docs/BENCHMARK.md`](docs/BENCHMARK.md).
-
-## Related work
-
-Koemi borrows from four lines of work and copies none of them whole.
-
-**Titans and MIRAS** ([Behrouz et al., 2501.00663](https://arxiv.org/abs/2501.00663); [Behrouz et al., 2504.13173](https://arxiv.org/abs/2504.13173)) treat sequence modeling as memory management and update a neural memory module while the sequence runs. Koemi keeps the framing and drops the mechanism: the associative memory here is a bounded decayed statistic with no inner gradient step, chosen so numerical stability can be separated from expressivity.
-
-**Mixture-of-Depths** ([Raposo et al., 2404.02258](https://arxiv.org/abs/2404.02258)) allocates compute per token by letting a router pick a top-k subset of tokens for the expensive block. Koemi's per-token fast and deep split is the same idea applied to a recurrent backbone, with one difference: the routing decision here is supervised by a measured loss gap instead of learned end-to-end through the block.
-
-**Adaptive Computation Time** ([Graves, 1603.08983](https://arxiv.org/abs/1603.08983)) learns how many recurrent steps to spend per input, with a ponder cost to stop the model from spending forever. `--deep-steps` is the fixed-budget version of that, and the compute penalty on mean risk is the ponder cost.
-
-**Switch Transformer** ([Fedus et al., 2101.03961](https://arxiv.org/abs/2101.03961)) contributes the load-balance penalty used to keep specialist selection from collapsing onto one path.
-
-The deeper reading list, including the recall results that motivate the local key-value buffer, is in [`docs/KOEMI_ARCHITECTURE.md`](docs/KOEMI_ARCHITECTURE.md).
+The harness compares OBOV with parameter-matched GRU and LSTM baselines. The
+old Koemi-1FPA measurements remain archived in [`docs/BENCHMARK.md`](docs/BENCHMARK.md)
+and are not OBOV results. No OBOV quality or speed claim is made until a new
+run has enough data for at least one model to solve the recall task.
 
 ## Known limitations
 
-- There is no long-term memory. Every state is created per forward call and dies with the request. Nothing persists across requests, and nothing is written back into the weights.
-- The tokenizer uses UTF-8 bytes. It accepts arbitrary text without a trained vocabulary, and it spends more positions per word than a learned BPE tokenizer. The ratio depends on the language and the corpus, so this repository does not quote one until it measures it.
-- The reference model steps through the sequence in Python. The benchmark shows what that costs against a cuDNN-backed GRU at the same parameter count.
-- The router is trained, but a trained router is not a calibrated one. No out-of-distribution, coverage, or confidently-wrong test has been run yet.
-- The five specialist paths share one class. Nothing in the objective forces them to learn different functions.
-- The checkpoint holds model weights only. There is no persistent episodic memory, retrieval system, tool use, or tenant storage.
-- A generated answer can still be wrong. Extra compute on uncertain tokens does not create missing factual knowledge.
+- Fixed-dispatch experts are not learned semantic routing.
+- The disk cache reuses exact hashed sequences only; “similar question” reuse
+  needs retrieval and a similarity contract outside this phase.
+- Disk entries contain recurrent state and logits and can encode prompt content.
+  The cache is opt-in and should remain session-scoped until TTL, deletion and
+  tenant controls exist.
+- SSD storage avoids recomputing an exact cached sequence but cannot replace
+  GPU or RAM for arbitrary active computation; I/O latency can dominate on an
+  HDD.
+- There is no `asyncio` cognition scheduler or arbitrary layer offload. KSM's
+  concurrency is tensor-level parallelism inside the causal scan window.
+- The diagonal associative memory may lose multi-key interactions. MQAR and
+  long-context recall are still required.
+- UTF-8 byte tokenization uses more positions than a learned tokenizer.
+- No distributed training, persistent episodic memory or tool use exists.
 
 ## Project layout
 
 ```text
 src/koemi/
-  configuration/  Runtime settings and constants
-  data/           JSON validation, adapters, serialization, tokenizer
-  model/          Recurrent state, memory, router, specialists, network
-  observability/  English runtime logging
-  training/       Causal chunks, router objective, trainer, checkpoint, generation
-benchmarks/       Koemi against parameter-matched GRU and LSTM baselines
-tests/
-  data/           Dataset and serialization contracts
-  model/          Model shape, routing, and gradient checks
-  training/       Training, checkpoint, and generation checks
+  configuration/  Model and training settings
+  data/           JSON validation, adapters, serialization and tokenizer
+  model/          KSM state, memory, cache, scan and fixed-dispatch MoE
+  training/       Causal chunks, objective, trainer, checkpoint and generation
+benchmarks/       OBOV against parameter-matched GRU and LSTM baselines
+tests/            Data, model, cache, execution and training contracts
 examples/         Valid JSON and JSONL inputs
 ```
 

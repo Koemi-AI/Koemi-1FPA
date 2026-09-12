@@ -7,11 +7,10 @@ from pathlib import Path
 
 import torch
 
-from koemi.configuration.settings import ModelSettings, RouterSettings, TrainingSettings
+from koemi.configuration.settings import ModelSettings, TrainingSettings
 from koemi.data.contracts import DatasetRecord
 from koemi.data.tokenizer import ByteTokenizer
 from koemi.model.network import KoemiModel
-from koemi.model.router import SPECIALIST_COUNT
 from koemi.training.checkpoints import CheckpointStore
 from koemi.training.dataset import CausalByteDataset, create_training_loader
 from koemi.training.generation import generate_text
@@ -26,26 +25,26 @@ def build_records() -> tuple[DatasetRecord, ...]:
 
 
 def build_model(**overrides) -> KoemiModel:
-    settings = dict(
-        embedding_size=16,
-        memory_features=4,
-        local_memory_size=4,
-        deep_steps=1,
-        active_specialists=1,
-        risk_threshold=0.65,
-    )
+    settings = dict(embedding_size=16, memory_features=4, local_memory_size=4, expert_count=1)
     settings.update(overrides)
     return KoemiModel(ModelSettings(**settings))
 
 
 class TrainingTests(unittest.TestCase):
-    def test_trains_saves_loads_and_generates(self) -> None:
+    def test_trains_saves_loads_and_generates_with_moe_and_thinking(self) -> None:
         torch.manual_seed(0)
         tokenizer = ByteTokenizer()
         dataset = CausalByteDataset(build_records(), sequence_length=64)
         loader = create_training_loader(dataset, batch_size=2)
         model = build_model()
-        training_settings = TrainingSettings(sequence_length=64, batch_size=2, epochs=1, learning_rate=0.001)
+        training_settings = TrainingSettings(
+            sequence_length=64,
+            batch_size=2,
+            epochs=1,
+            learning_rate=0.001,
+            device="cpu",
+            thinking_loss_weight=2.0,
+        )
         result = Trainer(logging.getLogger("koemi-test")).train(model, loader, training_settings)
         with tempfile.TemporaryDirectory() as temporary_directory:
             checkpoint_path = Path(temporary_directory) / "model.pt"
@@ -62,43 +61,22 @@ class TrainingTests(unittest.TestCase):
             )
         self.assertGreater(result.supervised_token_count, 0)
         self.assertGreater(result.token_count, result.supervised_token_count)
-        self.assertEqual(SPECIALIST_COUNT, len(result.specialist_activation_counts))
+        self.assertEqual((result.token_count,), result.expert_activation_counts)
+        self.assertGreater(result.mean_thinking_loss, 0.0)
         self.assertTrue(generated_text.startswith("A"))
 
-    def test_calibration_training_moves_the_risk_head(self) -> None:
+    def test_sequential_training_uses_the_same_objective_contract(self) -> None:
         torch.manual_seed(0)
         dataset = CausalByteDataset(build_records(), sequence_length=64)
         loader = create_training_loader(dataset, batch_size=2)
-        model = build_model()
-        initial_weight = model.router.observable_projection.weight.detach().clone()
-        training_settings = TrainingSettings(sequence_length=64, batch_size=2, epochs=1, learning_rate=0.01)
-        result = Trainer(logging.getLogger("koemi-test")).train(model, loader, training_settings)
-        moved = float((model.router.observable_projection.weight.detach() - initial_weight).abs().sum())
-        self.assertGreater(moved, 0.0)
-        self.assertGreater(result.mean_router_loss, 0.0)
-        self.assertGreaterEqual(result.router_accuracy, 0.0)
-        self.assertLessEqual(result.router_accuracy, 1.0)
-
-    def test_hard_routing_training_reports_no_router_loss(self) -> None:
-        torch.manual_seed(0)
-        dataset = CausalByteDataset(build_records(), sequence_length=64)
-        loader = create_training_loader(dataset, batch_size=2)
-        model = build_model()
-        training_settings = TrainingSettings(
-            sequence_length=64,
-            batch_size=2,
-            epochs=1,
-            learning_rate=0.001,
-            routing_mode="hard",
+        result = Trainer(logging.getLogger("koemi-test")).train(
+            build_model(expert_count=0),
+            loader,
+            TrainingSettings(sequence_length=64, batch_size=2, epochs=1, device="cpu", execution_mode="sequential"),
         )
-        result = Trainer(logging.getLogger("koemi-test")).train(model, loader, training_settings)
-        self.assertEqual(0.0, result.mean_router_loss)
-        self.assertAlmostEqual(result.mean_loss, result.mean_task_loss, places=6)
+        self.assertGreater(result.mean_loss, 0.0)
+        self.assertEqual((), result.expert_activation_counts)
 
-    def test_router_settings_reject_an_invalid_threshold(self) -> None:
+    def test_training_settings_reject_negative_thinking_weight(self) -> None:
         with self.assertRaises(ValueError):
-            RouterSettings(decision_threshold=1.5)
-
-    def test_training_settings_reject_an_unknown_routing_mode(self) -> None:
-        with self.assertRaises(ValueError):
-            TrainingSettings(routing_mode="soft")
+            TrainingSettings(thinking_loss_weight=-1.0)

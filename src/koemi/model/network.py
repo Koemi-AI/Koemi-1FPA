@@ -6,39 +6,32 @@ import torch
 from torch import Tensor, nn
 
 from koemi.configuration.settings import ModelSettings, PAD_TOKEN_ID
+from koemi.model.cache import CachedMapping, DiskMappingCache, WarmTokenCache
+from koemi.model.execution import ExecutionMode
+from koemi.model.experts import DeterministicExpertMixture
 from koemi.model.layers import RootMeanSquareNorm
 from koemi.model.memory import AssociativeMemory, BoundedRecurrentState, LocalKeyValueMemory
-from koemi.model.router import SPECIALIST_COUNT, RiskRouter, RouteSelection, RoutingMode
-from koemi.model.specialists import SpecialistPath
+from koemi.model.scan import affine_scan, previous_states
 from koemi.model.state import KoemiState
 
 
 @dataclass(frozen=True)
 class KoemiOutput:
     logits: Tensor
-    fast_logits: Tensor
     state: KoemiState
-    risk_logits: Tensor
-    risk_values: Tensor
-    route_weights: Tensor
-    specialist_selection: Tensor
-    executed_deep: Tensor
+    surprise_values: Tensor
+    expert_indices: Tensor
     valid_positions: Tensor
-    routing_mode: RoutingMode
     token_count: int
-    deep_token_count: int
-    specialist_activations: int
+    cache_hits: int
+    cache_misses: int
 
     @property
-    def deep_token_fraction(self) -> float:
-        if self.token_count == 0:
-            return 0.0
-        return self.deep_token_count / self.token_count
-
-    @property
-    def specialist_activation_counts(self) -> tuple[int, ...]:
-        counts = self.specialist_selection.sum(dim=0).sum(dim=0)
-        return tuple(int(count) for count in counts)
+    def expert_activation_counts(self) -> tuple[int, ...]:
+        if self.expert_indices.numel() == 0:
+            return ()
+        expert_count = max(int(self.expert_indices.max().detach()) + 1, 0)
+        return tuple(int((self.expert_indices == index).sum()) for index in range(expert_count))
 
 
 class KoemiModel(nn.Module):
@@ -50,179 +43,274 @@ class KoemiModel(nn.Module):
         self.input_normalizer = RootMeanSquareNorm(embedding_size)
         self.recurrent_state = BoundedRecurrentState(embedding_size)
         self.associative_memory = AssociativeMemory(embedding_size, settings.memory_features)
-        self.local_memory = LocalKeyValueMemory(settings.local_memory_size)
+        self.local_memory = LocalKeyValueMemory(embedding_size, settings.local_memory_size)
+        self.surprise_projection = nn.Linear(embedding_size, 1)
         self.fusion_projection = nn.Linear(embedding_size * 3, embedding_size)
         self.fusion_normalizer = RootMeanSquareNorm(embedding_size)
-        self.router = RiskRouter(
-            embedding_size,
-            settings.active_specialists,
-            settings.risk_threshold,
-            settings.exploration_interval,
-        )
-        self.specialists = nn.ModuleList(SpecialistPath(embedding_size) for _ in range(SPECIALIST_COUNT))
-        self.output_normalizer = RootMeanSquareNorm(embedding_size)
-        self.token_predictor = nn.Linear(embedding_size, settings.vocabulary_size, bias=False)
+        self.experts = DeterministicExpertMixture(embedding_size, settings.expert_count)
+        self.token_predictor = nn.Linear(embedding_size, settings.vocabulary_size)
 
     def forward(
         self,
         input_ids: Tensor,
         state: KoemiState | None = None,
-        routing_mode: RoutingMode = RoutingMode.HARD,
+        execution_mode: ExecutionMode = ExecutionMode.PARALLEL,
+        warm_cache: WarmTokenCache | None = None,
+        mapping_cache: DiskMappingCache | None = None,
     ) -> KoemiOutput:
         self.validate_input_ids(input_ids)
-        batch_size, sequence_length = input_ids.shape
-        current_state = state or KoemiState.create(
-            batch_size,
-            self.settings.embedding_size,
-            self.settings.memory_features,
-            input_ids.device,
+        if (warm_cache is not None or mapping_cache is not None) and self.training:
+            raise RuntimeError("inference caches are only valid while the model is in evaluation mode")
+        root_forward = state is None
+        if mapping_cache is not None:
+            if input_ids.shape[0] != 1:
+                raise ValueError("disk mapping cache requires batch size 1")
+            if root_forward:
+                cached_mapping = mapping_cache.get(input_ids, input_ids.device)
+                if cached_mapping is not None:
+                    return self.output_from_cached_mapping(cached_mapping, input_ids)
+        if execution_mode is ExecutionMode.SEQUENTIAL:
+            output = self.forward_sequential(input_ids, state, warm_cache)
+        else:
+            output = self.forward_parallel(input_ids, state, warm_cache)
+        if mapping_cache is not None and root_forward:
+            mapping_cache.put(input_ids, CachedMapping(
+                logits=output.logits,
+                state=output.state,
+                surprise_values=output.surprise_values,
+                expert_indices=output.expert_indices,
+                valid_positions=output.valid_positions,
+                token_count=output.token_count,
+            ))
+        return output
+
+    def initial_state(self, batch_size: int, device: torch.device) -> KoemiState:
+        return KoemiState.create(batch_size, self.settings.embedding_size, self.settings.memory_features, device)
+
+    def forward_parallel(
+        self,
+        input_ids: Tensor,
+        state: KoemiState | None,
+        warm_cache: WarmTokenCache | None,
+    ) -> KoemiOutput:
+        batch_size, length = input_ids.shape
+        current_state = state or self.initial_state(batch_size, input_ids.device)
+        window = self.settings.scan_chunk
+        if window >= length:
+            return self.forward_window(input_ids, current_state, warm_cache)
+        windows: list[KoemiOutput] = []
+        for start in range(0, length, window):
+            piece = self.forward_window(input_ids[:, start : start + window], current_state, warm_cache)
+            windows.append(piece)
+            current_state = piece.state
+        return concatenate_outputs(windows)
+
+    def forward_window(
+        self,
+        input_ids: Tensor,
+        current_state: KoemiState,
+        warm_cache: WarmTokenCache | None,
+    ) -> KoemiOutput:
+        batch_size, length = input_ids.shape
+        valid_mask = input_ids != PAD_TOKEN_ID
+        input_state, cache_hits, cache_misses = self.embed_inputs(input_ids, warm_cache)
+        retention, increment = self.recurrent_state.gates(input_state)
+        retention = torch.where(valid_mask.unsqueeze(-1), retention, torch.ones_like(retention))
+        increment = torch.where(valid_mask.unsqueeze(-1), increment, torch.zeros_like(increment))
+        working_states = affine_scan(retention, increment, current_state.working_state)
+        surprise = torch.sigmoid(self.surprise_projection(working_states)).squeeze(-1)
+
+        write_terms = self.associative_memory.write_terms(working_states, surprise)
+        write_decay = torch.where(valid_mask.unsqueeze(-1), write_terms.decay, torch.ones_like(write_terms.decay))
+        basis_increment = torch.where(
+            valid_mask.unsqueeze(-1).unsqueeze(-1), write_terms.basis_increment, torch.zeros_like(write_terms.basis_increment)
         )
-        routed_logits: list[Tensor] = []
-        preview_logits: list[Tensor] = []
-        risk_logits: list[Tensor] = []
-        risk_values: list[Tensor] = []
-        route_weights: list[Tensor] = []
-        specialist_selection: list[Tensor] = []
-        executed_deep: list[Tensor] = []
-        valid_positions: list[Tensor] = []
-        token_count = 0
-        deep_token_count = 0
-        specialist_activations = 0
-        for position in range(sequence_length):
+        normalizer_increment = torch.where(
+            valid_mask.unsqueeze(-1), write_terms.normalizer_increment, torch.zeros_like(write_terms.normalizer_increment)
+        )
+        basis_states = affine_scan(write_decay.unsqueeze(-1), basis_increment, current_state.memory_basis)
+        normalizer_states = affine_scan(write_decay, normalizer_increment, current_state.memory_normalizer)
+        memory_value, _ = self.associative_memory.read(
+            previous_states(basis_states, current_state.memory_basis),
+            previous_states(normalizer_states, current_state.memory_normalizer),
+            working_states,
+        )
+
+        local_keys, local_values, local_valid = self.local_memory.entries(working_states, valid_mask)
+        local_value, _ = self.local_memory.read_window(
+            current_state.local_keys,
+            current_state.local_values,
+            current_state.local_valid,
+            local_keys,
+            local_values,
+            local_valid,
+            working_states,
+        )
+        fused_context = self.fuse(working_states, memory_value, local_value)
+        final_context, expert_indices = self.experts(fused_context, input_ids, valid_mask)
+        logits = self.token_predictor(final_context)
+        next_local_keys, next_local_values, next_local_valid = self.local_memory.tail(
+            current_state.local_keys,
+            current_state.local_values,
+            current_state.local_valid,
+            local_keys,
+            local_values,
+            local_valid,
+        )
+        next_state = KoemiState(
+            working_state=working_states[:, -1],
+            memory_basis=basis_states[:, -1],
+            memory_normalizer=normalizer_states[:, -1],
+            local_keys=next_local_keys,
+            local_values=next_local_values,
+            local_valid=next_local_valid,
+            step_index=current_state.step_index + length,
+        )
+        return KoemiOutput(
+            logits=logits,
+            state=next_state,
+            surprise_values=surprise,
+            expert_indices=expert_indices,
+            valid_positions=valid_mask,
+            token_count=int(valid_mask.sum()),
+            cache_hits=cache_hits,
+            cache_misses=cache_misses,
+        )
+
+    def forward_sequential(
+        self,
+        input_ids: Tensor,
+        state: KoemiState | None,
+        warm_cache: WarmTokenCache | None,
+    ) -> KoemiOutput:
+        batch_size, length = input_ids.shape
+        current_state = state or self.initial_state(batch_size, input_ids.device)
+        logits_by_position: list[Tensor] = []
+        surprise_by_position: list[Tensor] = []
+        expert_indices_by_position: list[Tensor] = []
+        valid_by_position: list[Tensor] = []
+        cache_hits = 0
+        cache_misses = 0
+        for position in range(length):
             token_ids = input_ids[:, position]
             valid_mask = token_ids != PAD_TOKEN_ID
-            input_state = self.input_normalizer(self.embedding(token_ids))
-            proposed_working_state = self.recurrent_state(current_state.working_state, input_state)
-            working_state = torch.where(valid_mask.unsqueeze(-1), proposed_working_state, current_state.working_state)
+            input_state, position_hits, position_misses = self.embed_inputs(token_ids.unsqueeze(1), warm_cache)
+            cache_hits += position_hits
+            cache_misses += position_misses
+            input_state = input_state.squeeze(1)
+            working_state = torch.where(
+                valid_mask.unsqueeze(-1),
+                self.recurrent_state(current_state.working_state, input_state),
+                current_state.working_state,
+            )
+            surprise = torch.sigmoid(self.surprise_projection(working_state)).squeeze(-1)
             memory_value, _ = self.associative_memory.read(
-                current_state.memory_basis,
-                current_state.memory_normalizer,
-                working_state,
+                current_state.memory_basis, current_state.memory_normalizer, working_state
             )
-            local_value, novelty = self.local_memory.read(
+            local_value, _ = self.local_memory.read(
+                current_state.local_keys, current_state.local_values, current_state.local_valid, working_state
+            )
+            fused_context = self.fuse(working_state, memory_value, local_value)
+            final_context, expert_indices = self.experts(
+                fused_context.unsqueeze(1), token_ids.unsqueeze(1), valid_mask.unsqueeze(1)
+            )
+            logits_by_position.append(self.token_predictor(final_context[:, 0]))
+            surprise_by_position.append(surprise)
+            expert_indices_by_position.append(expert_indices[:, 0])
+            valid_by_position.append(valid_mask)
+
+            next_basis, next_normalizer = self.associative_memory.write(
+                current_state.memory_basis, current_state.memory_normalizer, working_state, surprise
+            )
+            written_key, written_value, written_valid = self.local_memory.entries(
+                working_state, valid_mask
+            )
+            next_local_keys, next_local_values, next_local_valid = self.local_memory.append(
                 current_state.local_keys,
                 current_state.local_values,
-                working_state,
-            )
-            fast_context = self.fusion_normalizer(
-                self.fusion_projection(torch.cat((working_state, memory_value, local_value), dim=-1))
-            )
-            fast_logits = self.token_predictor(fast_context)
-            uncertainty = self.calculate_uncertainty(fast_logits)
-            conflict = self.calculate_conflict(working_state, memory_value)
-            route_selection = self.router.select(
-                fast_context,
-                uncertainty,
-                conflict,
-                novelty,
-                current_state.step_index,
-            )
-            execute_deep = self.select_executed_rows(route_selection, valid_mask, routing_mode)
-            final_context, selection_mask = self.apply_deep_paths(
-                fast_context,
-                memory_value,
-                local_value,
-                route_selection,
-                execute_deep,
-            )
-            final_logits = self.token_predictor(final_context)
-            next_memory_basis, next_memory_normalizer = self.associative_memory.write(
-                current_state.memory_basis,
-                current_state.memory_normalizer,
-                working_state,
-                final_context,
-                fast_context,
-            )
-            next_local_keys, next_local_values = self.local_memory.append(
-                current_state.local_keys,
-                current_state.local_values,
-                working_state,
-                final_context,
-                valid_mask,
+                current_state.local_valid,
+                written_key,
+                written_value,
+                written_valid,
             )
             current_state = KoemiState(
                 working_state=working_state,
-                memory_basis=torch.where(valid_mask.view(batch_size, 1, 1), next_memory_basis, current_state.memory_basis),
-                memory_normalizer=torch.where(valid_mask.view(batch_size, 1), next_memory_normalizer, current_state.memory_normalizer),
+                memory_basis=torch.where(
+                    valid_mask.unsqueeze(-1).unsqueeze(-1), next_basis, current_state.memory_basis
+                ),
+                memory_normalizer=torch.where(
+                    valid_mask.unsqueeze(-1), next_normalizer, current_state.memory_normalizer
+                ),
                 local_keys=next_local_keys,
                 local_values=next_local_values,
+                local_valid=next_local_valid,
                 step_index=current_state.step_index + 1,
             )
-            routed_logits.append(final_logits)
-            preview_logits.append(fast_logits)
-            risk_logits.append(route_selection.risk_logit)
-            risk_values.append(route_selection.risk)
-            route_weights.append(route_selection.route_weights)
-            specialist_selection.append(selection_mask)
-            executed_deep.append(execute_deep)
-            valid_positions.append(valid_mask)
-            token_count += int(valid_mask.sum().item())
-            deep_token_count += int((route_selection.use_deep_path & valid_mask).sum().item())
-            specialist_activations += int(selection_mask.sum().item())
+        valid_positions = torch.stack(valid_by_position, dim=1)
+        expert_indices = torch.stack(expert_indices_by_position, dim=1)
         return KoemiOutput(
-            logits=torch.stack(routed_logits, dim=1),
-            fast_logits=torch.stack(preview_logits, dim=1),
+            logits=torch.stack(logits_by_position, dim=1),
             state=current_state,
-            risk_logits=torch.stack(risk_logits, dim=1),
-            risk_values=torch.stack(risk_values, dim=1),
-            route_weights=torch.stack(route_weights, dim=1),
-            specialist_selection=torch.stack(specialist_selection, dim=1),
-            executed_deep=torch.stack(executed_deep, dim=1),
-            valid_positions=torch.stack(valid_positions, dim=1),
-            routing_mode=routing_mode,
-            token_count=token_count,
-            deep_token_count=deep_token_count,
-            specialist_activations=specialist_activations,
+            surprise_values=torch.stack(surprise_by_position, dim=1),
+            expert_indices=expert_indices,
+            valid_positions=valid_positions,
+            token_count=int(valid_positions.sum()),
+            cache_hits=cache_hits,
+            cache_misses=cache_misses,
         )
 
-    def select_executed_rows(self, route_selection: RouteSelection, valid_mask: Tensor, routing_mode: RoutingMode) -> Tensor:
-        if routing_mode is RoutingMode.CALIBRATION:
-            return valid_mask.to(dtype=torch.float32)
-        return (route_selection.use_deep_path & valid_mask).to(dtype=torch.float32)
+    def embed_inputs(self, input_ids: Tensor, warm_cache: WarmTokenCache | None) -> tuple[Tensor, int, int]:
+        if warm_cache is None:
+            return self.input_normalizer(self.embedding(input_ids)), 0, 0
+        embeddings, cache_hits, cache_misses = warm_cache.embeddings(input_ids, self.embedding)
+        return self.input_normalizer(embeddings), cache_hits, cache_misses
+
+    def fuse(self, working_state: Tensor, memory_value: Tensor, local_value: Tensor) -> Tensor:
+        return self.fusion_normalizer(
+            self.fusion_projection(torch.cat((working_state, memory_value, local_value), dim=-1))
+        )
 
     def validate_input_ids(self, input_ids: Tensor) -> None:
         if input_ids.ndim != 2:
             raise ValueError("input_ids must have shape [batch, sequence]")
         if input_ids.numel() == 0:
             raise ValueError("input_ids must not be empty")
-        if int(input_ids.min().item()) < 0 or int(input_ids.max().item()) >= self.settings.vocabulary_size:
+        if int(input_ids.min()) < 0 or int(input_ids.max()) >= self.settings.vocabulary_size:
             raise ValueError("input_ids contain values outside the model vocabulary")
 
-    def calculate_uncertainty(self, logits: Tensor) -> Tensor:
-        content_logits = logits[:, :PAD_TOKEN_ID]
-        probabilities = torch.softmax(content_logits, dim=-1)
-        entropy = -(probabilities * probabilities.clamp_min(1e-8).log()).sum(dim=-1)
-        return entropy / torch.log(torch.tensor(float(PAD_TOKEN_ID), device=logits.device))
+    def output_from_cached_mapping(self, mapping: CachedMapping, input_ids: Tensor) -> KoemiOutput:
+        device = input_ids.device
+        if mapping.valid_positions.shape != input_ids.shape:
+            raise RuntimeError("disk cache entry sequence shape does not match the request")
+        state = KoemiState(
+            working_state=mapping.state.working_state.to(device),
+            memory_basis=mapping.state.memory_basis.to(device),
+            memory_normalizer=mapping.state.memory_normalizer.to(device),
+            local_keys=mapping.state.local_keys.to(device),
+            local_values=mapping.state.local_values.to(device),
+            local_valid=mapping.state.local_valid.to(device),
+            step_index=mapping.state.step_index,
+        )
+        return KoemiOutput(
+            logits=mapping.logits.to(device),
+            state=state,
+            surprise_values=mapping.surprise_values.to(device),
+            expert_indices=mapping.expert_indices.to(device),
+            valid_positions=mapping.valid_positions.to(device),
+            token_count=mapping.token_count,
+            cache_hits=0,
+            cache_misses=0,
+        )
 
-    def calculate_conflict(self, working_state: Tensor, memory_value: Tensor) -> Tensor:
-        difference = torch.linalg.vector_norm(working_state - memory_value, dim=-1)
-        scale = torch.linalg.vector_norm(working_state, dim=-1) + torch.linalg.vector_norm(memory_value, dim=-1) + 1e-6
-        return (difference / scale).clamp(0.0, 1.0)
 
-    def apply_deep_paths(
-        self,
-        fast_context: Tensor,
-        memory_value: Tensor,
-        local_value: Tensor,
-        route_selection: RouteSelection,
-        execute_deep: Tensor,
-    ) -> tuple[Tensor, Tensor]:
-        mixture_weights = self.router.mixture_weights(route_selection, execute_deep)
-        mixed_output = torch.zeros_like(fast_context)
-        for specialist_index in range(SPECIALIST_COUNT):
-            specialist_weights = mixture_weights[:, specialist_index]
-            row_indices = torch.nonzero(specialist_weights, as_tuple=False).squeeze(-1)
-            if row_indices.numel() == 0:
-                continue
-            specialist_output = self.specialists[specialist_index](
-                fast_context.index_select(0, row_indices),
-                memory_value.index_select(0, row_indices),
-                local_value.index_select(0, row_indices),
-                self.settings.deep_steps,
-            )
-            weighted_output = specialist_weights.index_select(0, row_indices).unsqueeze(-1) * specialist_output
-            mixed_output = mixed_output.index_add(0, row_indices, weighted_output)
-        deep_context = self.output_normalizer(fast_context + mixed_output)
-        deep_rows = execute_deep.unsqueeze(-1) > 0.0
-        final_context = torch.where(deep_rows, deep_context, fast_context)
-        return final_context, (mixture_weights > 0.0).to(dtype=torch.float32)
+def concatenate_outputs(windows: list[KoemiOutput]) -> KoemiOutput:
+    return KoemiOutput(
+        logits=torch.cat([window.logits for window in windows], dim=1),
+        state=windows[-1].state,
+        surprise_values=torch.cat([window.surprise_values for window in windows], dim=1),
+        expert_indices=torch.cat([window.expert_indices for window in windows], dim=1),
+        valid_positions=torch.cat([window.valid_positions for window in windows], dim=1),
+        token_count=sum(window.token_count for window in windows),
+        cache_hits=sum(window.cache_hits for window in windows),
+        cache_misses=sum(window.cache_misses for window in windows),
+    )

@@ -4,8 +4,9 @@ import torch
 
 from koemi.configuration.settings import PAD_TOKEN_ID
 from koemi.data.tokenizer import ByteTokenizer
+from koemi.model.cache import DiskMappingCache, WarmTokenCache
+from koemi.model.execution import ExecutionMode
 from koemi.model.network import KoemiModel
-from koemi.model.router import RoutingMode
 
 
 def generate_text(
@@ -15,6 +16,8 @@ def generate_text(
     max_new_bytes: int,
     temperature: float,
     device: str,
+    warm_cache: WarmTokenCache | None = None,
+    mapping_cache: DiskMappingCache | None = None,
 ) -> str:
     if not prompt:
         raise ValueError("prompt must not be empty")
@@ -27,7 +30,12 @@ def generate_text(
     model.eval()
     generated_ids = list(prompt_ids)
     with torch.no_grad():
-        output = model(input_ids, routing_mode=RoutingMode.HARD)
+        output = model(
+            input_ids,
+            execution_mode=ExecutionMode.PARALLEL,
+            warm_cache=warm_cache,
+            mapping_cache=mapping_cache,
+        )
         for _ in range(max_new_bytes):
             next_logits = output.logits[:, -1, :].clone()
             next_logits[:, PAD_TOKEN_ID] = float("-inf")
@@ -35,5 +43,11 @@ def generate_text(
             next_token = torch.multinomial(probabilities, num_samples=1)
             next_token_id = int(next_token.item())
             generated_ids.append(next_token_id)
-            output = model(next_token, output.state, routing_mode=RoutingMode.HARD)
+            output = model(
+                next_token,
+                output.state,
+                execution_mode=ExecutionMode.PARALLEL,
+                warm_cache=warm_cache,
+                mapping_cache=mapping_cache,
+            )
     return tokenizer.decode(generated_ids)

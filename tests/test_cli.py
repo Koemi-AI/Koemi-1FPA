@@ -13,7 +13,7 @@ from koemi.cli import main, write_utf8
 CANONICAL_RECORD = {
     "id": "queue-001",
     "input": "Explain FIFO in one sentence.",
-    "thinking": None,
+    "thinking": "A queue preserves arrival order.",
     "output": "FIFO means first in, first out.",
     "metadata": {"source": "test"},
 }
@@ -24,12 +24,12 @@ class CliOutputTests(unittest.TestCase):
         output = io.BytesIO()
         stdout = type("BufferedStdout", (), {"buffer": output})()
         with patch("koemi.cli.sys.stdout", stdout):
-            write_utf8("prefix �")
-        self.assertEqual(output.getvalue(), "prefix �\n".encode("utf-8"))
+            write_utf8("prefix ï¿½")
+        self.assertEqual(output.getvalue(), "prefix ï¿½\n".encode("utf-8"))
 
 
 class CliCommandTests(unittest.TestCase):
-    def test_trains_and_generates_through_the_router_flags(self) -> None:
+    def test_trains_and_generates_with_obov_flags(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             workspace = Path(temporary_directory)
             dataset_path = workspace / "dataset.jsonl"
@@ -50,18 +50,12 @@ class CliCommandTests(unittest.TestCase):
                     "4",
                     "--local-memory-size",
                     "4",
-                    "--deep-steps",
-                    "1",
-                    "--active-specialists",
-                    "1",
-                    "--routing-mode",
-                    "calibration",
-                    "--hard-margin",
-                    "0.02",
-                    "--compute-penalty-weight",
-                    "0.1",
-                    "--balance-loss-weight",
-                    "0.05",
+                    "--expert-count",
+                    "2",
+                    "--thinking-loss-weight",
+                    "2.0",
+                    "--device",
+                    "cpu",
                 ]
             )
             self.assertEqual(0, train_status)
@@ -83,6 +77,34 @@ class CliCommandTests(unittest.TestCase):
             self.assertEqual(0, generate_status)
             self.assertTrue(output.getvalue().startswith(b"FIFO"))
 
-    def test_rejects_an_unknown_routing_mode(self) -> None:
+    def test_old_routing_flags_are_removed(self) -> None:
         with self.assertRaises(SystemExit):
-            main(["train", "--dataset", "missing.jsonl", "--checkpoint", "model.pt", "--routing-mode", "soft"])
+            main(["train", "--dataset", "missing.jsonl", "--checkpoint", "model.pt", "--routing-mode", "hard"])
+
+    def test_sequential_execution_mode_trains(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            dataset_path = workspace / "dataset.jsonl"
+            dataset_path.write_text(json.dumps(CANONICAL_RECORD) + "\n", encoding="utf-8")
+            status = main(
+                [
+                    "train",
+                    "--dataset",
+                    str(dataset_path),
+                    "--checkpoint",
+                    str(workspace / "model.pt"),
+                    "--epochs",
+                    "1",
+                    "--embedding-size",
+                    "16",
+                    "--memory-features",
+                    "4",
+                    "--local-memory-size",
+                    "4",
+                    "--execution-mode",
+                    "sequential",
+                    "--device",
+                    "cpu",
+                ]
+            )
+            self.assertEqual(0, status)

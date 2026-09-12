@@ -12,26 +12,25 @@ from pathlib import Path
 
 import torch
 from torch import Tensor, nn
-from torch.nn import functional as functional
+from torch.nn import functional
 from torch.utils.data import DataLoader
 
 REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 
-from koemi.configuration.settings import PAD_TOKEN_ID, ModelSettings, RouterSettings, TrainingSettings
+from koemi.configuration.settings import ModelSettings, PAD_TOKEN_ID, TrainingSettings
 from koemi.data.contracts import DatasetRecord
 from koemi.model.network import KoemiModel
-from koemi.model.router import RoutingMode
-from koemi.training.dataset import IGNORE_TARGET_ID, CausalByteDataset, create_training_loader
-from koemi.training.routing import token_cross_entropy
+from koemi.training.dataset import CausalByteDataset, IGNORE_TARGET_ID, create_training_loader
+from koemi.training.objective import token_cross_entropy
 from koemi.training.trainer import Trainer
 
 MODEL_NAMES = ("koemi", "gru", "lstm")
 TASK_NAMES = ("bytes", "recall")
-VOCABULARY_SIZE = PAD_TOKEN_ID + 1
 NATS_PER_BIT = 0.6931471805599453
+VOCABULARY_SIZE = PAD_TOKEN_ID + 1
 
-SUBJECTS = ("the queue", "the stack", "the buffer", "the router", "the cache", "the parser")
+SUBJECTS = ("the queue", "the stack", "the buffer", "the cache", "the parser")
 VERBS = ("removes", "stores", "returns", "rejects", "accepts", "replaces")
 OBJECTS = ("the oldest item", "the newest item", "an invalid record", "a padded token", "the first byte")
 REASONS = ("because arrival order decides", "because the window is small", "because the contract requires it")
@@ -51,10 +50,7 @@ class BenchmarkReport:
     bits_per_byte: float
     evaluation_tokens_per_second: float
     peak_resident_bytes: int | None
-    deep_token_fraction: float | None
-    specialist_activation_counts: tuple[int, ...] | None
-    router_accuracy: float | None
-    fast_loss_nats: float | None
+    expert_activation_counts: tuple[int, ...] | None
 
 
 class RecurrentBaseline(nn.Module):
@@ -65,7 +61,7 @@ class RecurrentBaseline(nn.Module):
         self.embedding = nn.Embedding(VOCABULARY_SIZE, embedding_size, padding_idx=PAD_TOKEN_ID)
         cell_type = nn.GRU if cell_name == "gru" else nn.LSTM
         self.recurrent_cell = cell_type(embedding_size, hidden_size, batch_first=True)
-        self.token_predictor = nn.Linear(hidden_size, VOCABULARY_SIZE, bias=False)
+        self.token_predictor = nn.Linear(hidden_size, VOCABULARY_SIZE)
 
     def forward(self, input_ids: Tensor) -> Tensor:
         hidden_states, _ = self.recurrent_cell(self.embedding(input_ids))
@@ -164,11 +160,10 @@ def match_hidden_size(cell_name: str, embedding_size: int, target_parameter_coun
 
 def koemi_state_bytes(settings: ModelSettings) -> int:
     embedding_size = settings.embedding_size
-    working_state = embedding_size
-    memory_basis = embedding_size * settings.memory_features
-    memory_normalizer = settings.memory_features
-    local_memory = 2 * settings.local_memory_size * embedding_size
-    return (working_state + memory_basis + memory_normalizer + local_memory) * 4
+    state_scalars = embedding_size + embedding_size * settings.memory_features + settings.memory_features
+    local_bytes = 2 * settings.local_memory_size * embedding_size * 4
+    valid_bytes = settings.local_memory_size
+    return state_scalars * 4 + local_bytes + valid_bytes
 
 
 def evaluate_baseline(model: RecurrentBaseline, loader: DataLoader) -> tuple[float, float, int]:
@@ -191,14 +186,11 @@ def evaluate_baseline(model: RecurrentBaseline, loader: DataLoader) -> tuple[flo
     return total_loss / total_tokens, elapsed_seconds, total_tokens
 
 
-def evaluate_koemi(model: KoemiModel, loader: DataLoader) -> tuple[float, float, float, int, float, tuple[int, ...]]:
+def evaluate_koemi(model: KoemiModel, loader: DataLoader) -> tuple[float, float, int, tuple[int, ...]]:
     model.eval()
     total_loss = 0.0
-    total_fast_loss = 0.0
     total_tokens = 0
-    valid_tokens = 0
-    deep_tokens = 0
-    activation_counts = [0, 0, 0, 0, 0]
+    activation_counts: list[int] = []
     start_time = time.perf_counter()
     with torch.no_grad():
         for batch in loader:
@@ -207,24 +199,16 @@ def evaluate_koemi(model: KoemiModel, loader: DataLoader) -> tuple[float, float,
             supervised_count = int(supervised_mask.sum())
             if supervised_count == 0:
                 continue
-            output = model(batch["input_ids"], routing_mode=RoutingMode.HARD)
+            output = model(batch["input_ids"])
             total_loss += float((token_cross_entropy(output.logits, target_ids) * supervised_mask).sum())
-            total_fast_loss += float((token_cross_entropy(output.fast_logits, target_ids) * supervised_mask).sum())
             total_tokens += supervised_count
-            valid_tokens += output.token_count
-            deep_tokens += output.deep_token_count
-            for index, count in enumerate(output.specialist_activation_counts):
+            counts = output.expert_activation_counts
+            if len(activation_counts) < len(counts):
+                activation_counts.extend([0] * (len(counts) - len(activation_counts)))
+            for index, count in enumerate(counts):
                 activation_counts[index] += count
     elapsed_seconds = time.perf_counter() - start_time
-    deep_fraction = deep_tokens / valid_tokens if valid_tokens else 0.0
-    return (
-        total_loss / total_tokens,
-        total_fast_loss / total_tokens,
-        elapsed_seconds,
-        total_tokens,
-        deep_fraction,
-        tuple(activation_counts),
-    )
+    return total_loss / total_tokens, elapsed_seconds, total_tokens, tuple(activation_counts)
 
 
 def train_baseline(model: RecurrentBaseline, loader: DataLoader, arguments: argparse.Namespace) -> tuple[float, float, int]:
@@ -263,40 +247,31 @@ def run_single_model(arguments: argparse.Namespace) -> BenchmarkReport:
     evaluation_records = build_records(arguments.task, generator, arguments.evaluation_records, "eval")
     train_dataset = CausalByteDataset(train_records, arguments.sequence_length)
     evaluation_dataset = CausalByteDataset(evaluation_records, arguments.sequence_length)
-    train_loader = create_training_loader(train_dataset, arguments.batch_size)
-    evaluation_loader = create_training_loader(evaluation_dataset, arguments.batch_size)
-
+    train_loader = create_training_loader(train_dataset, arguments.batch_size, torch.Generator().manual_seed(arguments.seed))
+    evaluation_loader = create_training_loader(
+        evaluation_dataset, arguments.batch_size, torch.Generator().manual_seed(arguments.seed)
+    )
     model_settings = ModelSettings(
         embedding_size=arguments.embedding_size,
         memory_features=arguments.memory_features,
         local_memory_size=arguments.local_memory_size,
-        deep_steps=arguments.deep_steps,
-        active_specialists=arguments.active_specialists,
-        risk_threshold=arguments.risk_threshold,
+        expert_count=arguments.expert_count,
     )
-    reference_model = KoemiModel(model_settings)
-    koemi_parameter_count, koemi_parameter_bytes = count_parameter_bytes(reference_model)
-
+    koemi_parameter_count, koemi_parameter_bytes = count_parameter_bytes(KoemiModel(model_settings))
+    torch.manual_seed(arguments.seed)
     if arguments.model == "koemi":
+        model = KoemiModel(model_settings)
         training_settings = TrainingSettings(
             sequence_length=arguments.sequence_length,
             batch_size=arguments.batch_size,
             epochs=arguments.epochs,
             learning_rate=arguments.learning_rate,
-            routing_mode="calibration",
-        )
-        router_settings = RouterSettings(
-            hard_margin=arguments.hard_margin,
-            balance_loss_weight=arguments.balance_loss_weight,
-            compute_penalty_weight=arguments.compute_penalty_weight,
-            decision_threshold=arguments.risk_threshold,
+            device="cpu",
         )
         logger = logging.getLogger("koemi-benchmark")
         logger.addHandler(logging.NullHandler())
-        result = Trainer(logger).train(reference_model, train_loader, training_settings, router_settings)
-        loss, fast_loss, evaluation_seconds, evaluation_tokens, deep_fraction, activations = evaluate_koemi(
-            reference_model, evaluation_loader
-        )
+        result = Trainer(logger).train(model, train_loader, training_settings)
+        loss, evaluation_seconds, evaluation_tokens, activations = evaluate_koemi(model, evaluation_loader)
         return BenchmarkReport(
             model_name="koemi",
             task_name=arguments.task,
@@ -305,18 +280,15 @@ def run_single_model(arguments: argparse.Namespace) -> BenchmarkReport:
             state_bytes_per_sequence=koemi_state_bytes(model_settings),
             train_seconds=result.elapsed_seconds,
             train_tokens_per_second=result.supervised_token_count / result.elapsed_seconds,
-            train_loss_nats=result.mean_deep_loss,
+            train_loss_nats=result.mean_loss,
             evaluation_loss_nats=loss,
             bits_per_byte=loss / NATS_PER_BIT,
             evaluation_tokens_per_second=evaluation_tokens / evaluation_seconds,
             peak_resident_bytes=peak_resident_bytes(),
-            deep_token_fraction=deep_fraction,
-            specialist_activation_counts=activations,
-            router_accuracy=result.router_accuracy,
-            fast_loss_nats=fast_loss,
+            expert_activation_counts=activations,
         )
-
     hidden_size = match_hidden_size(arguments.model, arguments.embedding_size, koemi_parameter_count)
+    torch.manual_seed(arguments.seed)
     baseline = RecurrentBaseline(arguments.model, arguments.embedding_size, hidden_size)
     parameter_count, parameter_bytes = count_parameter_bytes(baseline)
     train_loss, train_seconds, train_tokens = train_baseline(baseline, train_loader, arguments)
@@ -334,10 +306,7 @@ def run_single_model(arguments: argparse.Namespace) -> BenchmarkReport:
         bits_per_byte=loss / NATS_PER_BIT,
         evaluation_tokens_per_second=evaluation_tokens / evaluation_seconds,
         peak_resident_bytes=peak_resident_bytes(),
-        deep_token_fraction=None,
-        specialist_activation_counts=None,
-        router_accuracy=None,
-        fast_loss_nats=None,
+        expert_activation_counts=None,
     )
 
 
@@ -357,7 +326,7 @@ def run_every_model(arguments: argparse.Namespace) -> list[dict]:
 
 
 def create_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Koemi-1FPA benchmark against GRU and LSTM baselines")
+    parser = argparse.ArgumentParser(description="Koemi-2OBOV benchmark against GRU and LSTM baselines")
     parser.add_argument("--model", choices=MODEL_NAMES, default=None)
     parser.add_argument("--task", choices=TASK_NAMES, default="bytes")
     parser.add_argument("--seed", type=int, default=17)
@@ -370,12 +339,7 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--embedding-size", type=int, default=48)
     parser.add_argument("--memory-features", type=int, default=12)
     parser.add_argument("--local-memory-size", type=int, default=12)
-    parser.add_argument("--deep-steps", type=int, default=1)
-    parser.add_argument("--active-specialists", type=int, default=2)
-    parser.add_argument("--risk-threshold", type=float, default=0.65)
-    parser.add_argument("--hard-margin", type=float, default=0.05)
-    parser.add_argument("--compute-penalty-weight", type=float, default=0.05)
-    parser.add_argument("--balance-loss-weight", type=float, default=0.05)
+    parser.add_argument("--expert-count", type=int, default=0)
     parser.add_argument("--report", default=None)
     return parser
 
@@ -386,6 +350,7 @@ def main(argument_values: list[str] | None = None) -> int:
         print(json.dumps(asdict(run_single_model(arguments)), indent=2, sort_keys=True))
         return 0
     payload = {
+        "architecture": "Koemi-2OBOV",
         "task": arguments.task,
         "seed": arguments.seed,
         "platform": sys.platform,

@@ -13,6 +13,7 @@ class KoemiState:
     memory_normalizer: Tensor
     local_keys: Tensor
     local_values: Tensor
+    local_valid: Tensor
     step_index: int
 
     @classmethod
@@ -23,5 +24,6 @@ class KoemiState:
             memory_normalizer=torch.zeros(batch_size, memory_features, device=device),
             local_keys=torch.empty(batch_size, 0, embedding_size, device=device),
             local_values=torch.empty(batch_size, 0, embedding_size, device=device),
+            local_valid=torch.empty(batch_size, 0, dtype=torch.bool, device=device),
             step_index=0,
         )

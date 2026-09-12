@@ -18,6 +18,7 @@ IGNORE_TARGET_ID = -100
 class CausalChunk:
     input_ids: tuple[int, ...]
     target_ids: tuple[int, ...]
+    thinking_mask: tuple[bool, ...]
 
 
 class CausalByteDataset(Dataset[CausalChunk]):
@@ -35,6 +36,8 @@ class CausalByteDataset(Dataset[CausalChunk]):
         return self.chunks[index]
 
     def create_chunks(self, records: tuple[DatasetRecord, ...], sequence_length: int) -> tuple[CausalChunk, ...]:
+        if sequence_length < 1:
+            raise ValueError("sequence_length must be at least 1")
         chunks: list[CausalChunk] = []
         for record in records:
             serialized_record = serialize_record(record)
@@ -46,24 +49,37 @@ class CausalByteDataset(Dataset[CausalChunk]):
                 input_ids = token_ids[start_index:end_index]
                 raw_target_ids = token_ids[start_index + 1 : end_index + 1]
                 target_positions = serialized_record.supervised_positions[start_index + 1 : end_index + 1]
+                thinking_positions = serialized_record.thinking_positions[start_index + 1 : end_index + 1]
                 target_ids = tuple(
                     token_id if is_supervised else IGNORE_TARGET_ID
                     for token_id, is_supervised in zip(raw_target_ids, target_positions, strict=True)
                 )
-                chunks.append(CausalChunk(input_ids, target_ids))
+                chunks.append(CausalChunk(input_ids, target_ids, thinking_positions))
         return tuple(chunks)
 
 
-def create_training_loader(dataset: CausalByteDataset, batch_size: int) -> DataLoader[CausalChunk]:
-    return DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_chunks)
+def create_training_loader(
+    dataset: CausalByteDataset,
+    batch_size: int,
+    generator: torch.Generator | None = None,
+) -> DataLoader[CausalChunk]:
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=collate_chunks,
+        generator=generator,
+    )
 
 
 def collate_chunks(chunks: list[CausalChunk]) -> dict[str, Tensor]:
     maximum_length = max(len(chunk.input_ids) for chunk in chunks)
     input_ids = torch.full((len(chunks), maximum_length), PAD_TOKEN_ID, dtype=torch.long)
     target_ids = torch.full((len(chunks), maximum_length), IGNORE_TARGET_ID, dtype=torch.long)
+    thinking_mask = torch.zeros((len(chunks), maximum_length), dtype=torch.bool)
     for row_index, chunk in enumerate(chunks):
         chunk_length = len(chunk.input_ids)
         input_ids[row_index, :chunk_length] = torch.tensor(chunk.input_ids, dtype=torch.long)
         target_ids[row_index, :chunk_length] = torch.tensor(chunk.target_ids, dtype=torch.long)
-    return {"input_ids": input_ids, "target_ids": target_ids}
+        thinking_mask[row_index, :chunk_length] = torch.tensor(chunk.thinking_mask, dtype=torch.bool)
+    return {"input_ids": input_ids, "target_ids": target_ids, "thinking_mask": thinking_mask}

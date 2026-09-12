@@ -18,6 +18,12 @@ class SerializationTests(unittest.TestCase):
         )
         self.assertIn(b"Reasoning", supervised_bytes)
         self.assertIn(b"Answer", supervised_bytes)
+        thinking_bytes = bytes(
+            token_byte
+            for token_byte, is_thinking in zip(serialized_record.token_bytes, serialized_record.thinking_positions, strict=True)
+            if is_thinking
+        )
+        self.assertEqual(b"Reasoning", thinking_bytes)
 
     def test_plain_text_record_supervises_every_target_byte(self) -> None:
         record = DatasetRecord("plain", "Plain document", None, None, {})
