@@ -140,4 +140,4 @@ examples/         Valid JSON and JSONL inputs
 
 ## License
 
-No license has been granted. Treat this repository as private unless its owner adds a license file.
+This project is licensed under the MIT License. See [LICENSE](LICENSE).
