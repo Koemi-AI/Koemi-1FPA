@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "koemi"
+version = "0.1.0"
+description = "Koemi-1FPA byte-level recurrent language model prototype"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["numpy>=2.1", "torch>=2.8"]
+
+[project.scripts]
+koemi = "koemi.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

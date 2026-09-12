@@ -1,0 +1,10 @@
+[
+  {
+    "instruction": "Define a stack.",
+    "input": "",
+    "output": "A stack removes the most recently added item first.",
+    "metadata": {
+      "source": "example"
+    }
+  }
+]

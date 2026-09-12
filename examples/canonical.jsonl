@@ -1,0 +1,3 @@
+{"id":"queue-001","input":"Explain FIFO in one sentence.","thinking":"FIFO preserves arrival order, so the first item added is the first item removed.","output":"FIFO means first in, first out.","metadata":{"source":"example"}}
+{"id":"queue-002","input":"What does a queue remove first?","thinking":null,"output":"A queue removes the oldest item first.","metadata":{"source":"example"}}
+{"id":"plain-001","input":"A byte-level language model predicts the next byte from previous bytes.","thinking":null,"output":null,"metadata":{"source":"example"}}
