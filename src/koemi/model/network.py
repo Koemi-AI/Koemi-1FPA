@@ -36,9 +36,10 @@ class KoemiOutput:
 
     @property
     def expert_activation_counts(self) -> tuple[int, ...]:
-        if self.expert_indices.numel() == 0:
+        if self.expert_count == 0 or self.expert_indices.numel() == 0:
             return ()
-        return tuple(int((self.expert_indices == index).sum()) for index in range(self.expert_count))
+        occupancy = torch.bincount(self.expert_indices.reshape(-1) + 1, minlength=self.expert_count + 1)
+        return tuple(occupancy[1:].tolist())
 
 
 class KoemiModel(nn.Module):
