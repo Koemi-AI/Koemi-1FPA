@@ -26,7 +26,9 @@ its own derived fields raises instead of being written.
 | `train_tokens_per_second` | `train_tokens / elapsed_seconds`. Identical to the including-validation field, kept so older numbers stay comparable. |
 | `train_tokens_per_second_including_validation` | Same ratio, named without ambiguity. |
 | `train_tokens_per_second_excluding_validation` | `train_tokens / (elapsed_seconds - validation_seconds_inside_elapsed)`. Use this one to compare models. |
-| `seed`, `epochs`, `optimizer_steps`, `batch_size`, `sequence_length` | Run configuration. |
+| `seed` | Weight initialization and stochastic training seed. |
+| `data_seed` | Synthetic data generation, validation split and loader shuffle seed. |
+| `epochs`, `optimizer_steps`, `batch_size`, `sequence_length` | Run configuration. |
 | `precision`, `device`, `ablation` | `fp32`, `bf16` or `fp16`; the PyTorch device; the ablation name, `none` for a baseline. |
 | `seeds_used` | Every seed behind the numbers. A single run reports one seed. |
 | `validation_bpb_std` | Sample standard deviation of per-seed `validation_bpb`. `null` for a single seed. |

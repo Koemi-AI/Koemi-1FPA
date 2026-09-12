@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 
-from koemi.configuration.settings import ModelSettings, PAD_TOKEN_ID, TrainingSettings
+from koemi.configuration.settings import DEFAULT_DATA_SEED, ModelSettings, PAD_TOKEN_ID, TrainingSettings
 from koemi.data.contracts import DatasetRecord
 from koemi.model.network import KoemiModel
 from koemi.observability.report import (
@@ -324,6 +324,7 @@ def run_koemi(arguments: argparse.Namespace, model_settings: ModelSettings, load
         elapsed_seconds=training.elapsed_seconds,
         validation_seconds_inside_elapsed=training.validation_seconds_inside_elapsed,
         seed=arguments.seed,
+        data_seed=arguments.data_seed,
         epochs=arguments.epochs,
         optimizer_steps=training.optimizer_steps,
         batch_size=arguments.batch_size,
@@ -359,6 +360,7 @@ def run_baseline(arguments: argparse.Namespace, target_parameter_count: int, loa
         elapsed_seconds=training.elapsed_seconds,
         validation_seconds_inside_elapsed=0.0,
         seed=arguments.seed,
+        data_seed=arguments.data_seed,
         epochs=arguments.epochs,
         optimizer_steps=training.optimizer_steps,
         batch_size=arguments.batch_size,
@@ -376,14 +378,14 @@ def run_baseline(arguments: argparse.Namespace, target_parameter_count: int, loa
 
 def run_single_model(arguments: argparse.Namespace) -> dict:
     torch.manual_seed(arguments.seed)
-    generator = random.Random(arguments.seed)
+    generator = random.Random(arguments.data_seed)
     train_records = build_records(arguments.task, generator, arguments.train_records, "train")
     evaluation_records = build_records(arguments.task, generator, arguments.evaluation_records, "eval")
     train_dataset = CausalByteDataset(train_records, arguments.sequence_length)
     evaluation_dataset = CausalByteDataset(evaluation_records, arguments.sequence_length)
-    train_loader = create_training_loader(train_dataset, arguments.batch_size, torch.Generator().manual_seed(arguments.seed))
+    train_loader = create_training_loader(train_dataset, arguments.batch_size, torch.Generator().manual_seed(arguments.data_seed))
     evaluation_loader = create_training_loader(
-        evaluation_dataset, arguments.batch_size, torch.Generator().manual_seed(arguments.seed)
+        evaluation_dataset, arguments.batch_size, torch.Generator().manual_seed(arguments.data_seed)
     )
     model_settings = ModelSettings(
         embedding_size=arguments.embedding_size,
@@ -421,6 +423,7 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", choices=MODEL_NAMES, default=None)
     parser.add_argument("--task", choices=TASK_NAMES, default="bytes")
     parser.add_argument("--seed", type=int, default=17)
+    parser.add_argument("--data-seed", type=int, default=DEFAULT_DATA_SEED)
     parser.add_argument("--train-records", type=int, default=48)
     parser.add_argument("--evaluation-records", type=int, default=16)
     parser.add_argument("--sequence-length", type=int, default=96)
@@ -445,6 +448,7 @@ def main(argument_values: list[str] | None = None) -> int:
         "architecture": "Koemi-2OBOV",
         "task": arguments.task,
         "seed": arguments.seed,
+        "data_seed": arguments.data_seed,
         "platform": sys.platform,
         "torch_version": torch.__version__,
         "runs": run_every_model(arguments),

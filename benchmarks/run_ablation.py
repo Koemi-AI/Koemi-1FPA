@@ -9,6 +9,7 @@ from pathlib import Path
 REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 
+from koemi.configuration.settings import DEFAULT_DATA_SEED
 from koemi.observability.report import RunReport, aggregate_run_reports, render_json
 
 
@@ -19,6 +20,7 @@ def run_one(
     benchmark_path: Path,
     task: str,
     seed: int,
+    data_seed: int,
     train_records: int,
     evaluation_records: int,
     sequence_length: int,
@@ -38,6 +40,8 @@ def run_one(
         task,
         "--seed",
         str(seed),
+        "--data-seed",
+        str(data_seed),
         "--train-records",
         str(train_records),
         "--evaluation-records",
@@ -76,6 +80,7 @@ def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run three-seed Koemi ablations with an affine control")
     parser.add_argument("--task", choices=("bytes", "recall"), default="recall")
     parser.add_argument("--seeds", type=int, nargs="+", default=(17, 29, 41))
+    parser.add_argument("--data-seed", type=int, default=DEFAULT_DATA_SEED)
     parser.add_argument("--train-records", type=int, default=16)
     parser.add_argument("--evaluation-records", type=int, default=1024)
     parser.add_argument("--sequence-length", type=int, default=96)
@@ -100,6 +105,7 @@ def main(argument_values: list[str] | None = None) -> int:
                 benchmark_path,
                 arguments.task,
                 seed,
+                arguments.data_seed,
                 arguments.train_records,
                 arguments.evaluation_records,
                 arguments.sequence_length,

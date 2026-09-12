@@ -43,6 +43,31 @@ class BenchmarkMetricTests(unittest.TestCase):
 
 
 class BenchmarkReportSchemaTests(unittest.TestCase):
+    def test_weight_seeds_keep_data_token_counts_identical(self) -> None:
+        reports = []
+        for weight_seed in (17, 29, 41):
+            arguments = create_parser().parse_args(
+                [
+                    "--model", "koemi",
+                    "--task", "bytes",
+                    "--seed", str(weight_seed),
+                    "--data-seed", "123",
+                    "--train-records", "4",
+                    "--evaluation-records", "2",
+                    "--sequence-length", "32",
+                    "--batch-size", "2",
+                    "--epochs", "1",
+                    "--embedding-size", "16",
+                    "--memory-features", "4",
+                    "--local-memory-size", "4",
+                ]
+            )
+            reports.append(run_single_model(arguments)["report"])
+        self.assertEqual(
+            {(report["train_tokens"], report["validation_tokens"]) for report in reports},
+            {(reports[0]["train_tokens"], reports[0]["validation_tokens"])},
+        )
+
     def test_every_model_emits_the_same_report_schema(self) -> None:
         payloads = {model_name: run_model(model_name) for model_name in ("koemi", "gru", "lstm")}
         schemas = {model_name: set(payload["report"]) for model_name, payload in payloads.items()}

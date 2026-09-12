@@ -52,6 +52,7 @@ class RunReport:
     train_tokens_per_second: float
     elapsed_seconds: float
     seed: int
+    data_seed: int
     epochs: int
     optimizer_steps: int
     batch_size: int
@@ -175,6 +176,7 @@ def build_run_report(
     elapsed_seconds: float,
     validation_seconds_inside_elapsed: float,
     seed: int,
+    data_seed: int,
     epochs: int,
     optimizer_steps: int,
     batch_size: int,
@@ -202,6 +204,7 @@ def build_run_report(
         train_tokens_per_second=train_tokens / total_seconds,
         elapsed_seconds=total_seconds,
         seed=seed,
+        data_seed=data_seed,
         epochs=epochs,
         optimizer_steps=optimizer_steps,
         batch_size=batch_size,
@@ -235,6 +238,7 @@ SHARED_AGGREGATE_FIELDS = (
     "precision",
     "device",
     "ablation",
+    "data_seed",
     "peak_memory_source",
 )
 
@@ -264,6 +268,7 @@ def aggregate_run_reports(reports: Sequence[RunReport]) -> RunReport:
         train_tokens_per_second=first_report.train_tokens / elapsed_seconds,
         elapsed_seconds=elapsed_seconds,
         seed=seeds[0],
+        data_seed=first_report.data_seed,
         epochs=first_report.epochs,
         optimizer_steps=first_report.optimizer_steps,
         batch_size=first_report.batch_size,
