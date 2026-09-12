@@ -9,9 +9,15 @@ updated_at: 2026-09-11
 ## Goal
 
 Define a Python-first sequence model that can be trained and served without
-quadratic global attention, while preserving a precise local retrieval path
-and an explicit long-term memory boundary. The design is a research baseline,
-not a claim of Transformer parity.
+quadratic global attention, while preserving a precise local retrieval path.
+The design is a research baseline, not a claim of Transformer parity.
+
+This document is the specification, not a description of the code. It describes
+where a long-term memory would attach and what that attachment would have to
+guarantee. No long-term memory exists in the implementation: every state in
+`src/koemi` is created per forward call and dies with the request. The
+[implementation status](#implementation-status) section lists what is built,
+what is not, and where the two diverge.
 
 ## Scope
 
@@ -186,6 +192,25 @@ flowchart LR
     A -. optional exact fact lookup .-> X[Episodic store]
     X -. audited result .-> R
 ```
+
+## Implementation status
+
+| Specification | Code | Status |
+| --- | --- | --- |
+| Bounded recurrent working state (section 2) | `src/koemi/model/memory.py` `BoundedRecurrentState` | implemented |
+| Semantic associative memory with decay and write gate (section 3) | `src/koemi/model/memory.py` `AssociativeMemory` | implemented |
+| Surprise gate `s_t` (section 4) | none | phase 2, not implemented |
+| Exact local retrieval buffer (section 5) | `src/koemi/model/memory.py` `LocalKeyValueMemory` | implemented |
+| Simplex branch gate `rho_t = softmax(W_r u_t)` (section 6) | `src/koemi/model/network.py` `fusion_projection` | diverges: the code concatenates the three branches and applies one learned projection, the second option allowed by decision D-006 |
+| Residual SwiGLU sublayer on the main path (section 6) | `src/koemi/model/specialists.py` only | diverges: the gated feed-forward runs inside the specialist path, so the fast path has no residual sublayer |
+| Language-model head with bias `b_vocab` (section 6) | `src/koemi/model/network.py` `token_predictor` | diverges: the head has no bias term |
+| Cognitive step index `J_t` chosen per token (adaptive cognition review) | `--deep-steps` | diverges: the step count is a fixed hyperparameter, identical for every token |
+| Risk head over normalized observables (unknown-case safety rule) | `src/koemi/model/router.py` `RiskRouter` | implemented over uncertainty, conflict, and novelty; the disagreement term is not implemented |
+| Router loss from a measured `hard_t` label | `src/koemi/training/routing.py` | implemented as binary cross entropy against `(L_fast - L_deep) > margin`, plus a compute penalty |
+| Hard routing at inference, soft supervision at training | `RoutingMode.HARD` and `RoutingMode.CALIBRATION` | implemented |
+| Load-balance penalty over paths | `src/koemi/training/routing.py` `calculate_balance_loss` | implemented |
+| Parallel scan path (Python training plan) | none | not implemented |
+| Episodic store `L2` and consolidated `L3` | none | not implemented |
 
 ## Precise state and update equations
 
@@ -610,3 +635,6 @@ untyped memory tensor.
 - Lialin et al. [Zoology: Measuring and Improving Recall in Efficient Language Models](https://arxiv.org/pdf/2312.04927).
 - Dao and Gu. [Transformers are SSMs: Generalized Models and Efficient Algorithms Through Structured State Space Duality](https://arxiv.org/abs/2405.21060).
 - Beck et al. [xLSTM: Extended Long Short-Term Memory](https://arxiv.org/abs/2405.04517).
+- Raposo, Ritter, Richards, Lillicrap, Humphreys, and Santoro. [Mixture-of-Depths: Dynamically allocating compute in transformer-based language models](https://arxiv.org/abs/2404.02258).
+- Graves. [Adaptive Computation Time for Recurrent Neural Networks](https://arxiv.org/abs/1603.08983).
+- Fedus, Zoph, and Shazeer. [Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity](https://arxiv.org/abs/2101.03961).
