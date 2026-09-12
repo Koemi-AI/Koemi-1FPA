@@ -39,6 +39,10 @@ def run_model(model_name: str) -> dict:
 
 
 class BenchmarkMetricTests(unittest.TestCase):
+    def test_benchmark_accepts_compile_flag(self) -> None:
+        arguments = create_parser().parse_args(["--compile"])
+        self.assertTrue(arguments.compile)
+
     def test_standard_error_is_defined_for_multiple_token_losses(self) -> None:
         self.assertAlmostEqual(evaluation_error([1.0, 2.0, 3.0]), 1.0 / math.sqrt(3.0), places=7)
 

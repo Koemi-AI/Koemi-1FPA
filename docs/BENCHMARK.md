@@ -65,6 +65,12 @@ counts. `benchmarks/run_ablation.py` gives each ablation a `report` holding the
 multi-seed aggregate, plus `reports_by_seed` and `diagnostics_by_seed` so the
 standard deviation can be audited against the runs behind it.
 
+The benchmark accepts `--device`, `--precision` and `--compile`. `auto` selects
+CUDA when available and otherwise CPU; `--compile` uses `torch.compile` with
+dynamic shapes. Compilation is not a performance result until warmup and the
+compiled execution are measured separately. On Windows, Inductor may require
+the MSVC C++ compiler (`cl`) even for a CPU smoke run.
+
 ## Historical Koemi-1FPA run
 
 Measured on 2026-09-11 with Python 3.13.14, PyTorch 2.14.0+cpu and four CPU
