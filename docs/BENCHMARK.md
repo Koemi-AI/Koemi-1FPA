@@ -23,9 +23,23 @@ optimization behavior, not architectural ceilings. The old Koemi router sent
 0.10% of `bytes` tokens and 1.56% of `recall` tokens to its deep path, with no
 measurable loss gain. That machinery was removed from OBOV.
 
-## Koemi-2OBOV run
+## Koemi-2OBOV HERM smoke run
 
-Status: not measured yet.
+Measured on 2026-09-12 with PyTorch 2.14.0+cpu and four CPU threads. This is a
+single small recall smoke run: 16 training records, 8 evaluation records, 96
+positions, batch size 4 and one epoch. It is diagnostic, not a quality claim.
+
+| Model | Bits/byte | Eval loss | Train tokens/s | Eval tokens/s | Parameters | State bytes/sequence |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Koemi-2OBOV HERM (bytes) | 6.095 | 4.225 | 878.1 | 3,236.1 | 27,756 | 4,304 |
+| Koemi-2OBOV HERM | 7.552 | 5.235 | 102.6 | 356.9 | 27,756 | 4,304 |
+
+The immediately preceding same-budget Koemi snapshot measured 7.722 bits/byte,
+5.352 eval loss, 91.1 train tokens/s, 353.3 eval tokens/s, 27,660 parameters and
+3,240 state bytes/sequence. The observed deltas are -2.2% bits/byte, -2.2% loss,
++12.6% train throughput and +1.0% eval throughput, with +0.35% parameters and
++32.8% recurrent state. One timing run is noisy; only the quality/state deltas
+are useful as an early regression signal.
 
 Commands:
 

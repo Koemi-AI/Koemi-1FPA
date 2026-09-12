@@ -36,8 +36,11 @@ class ExecutionEquivalenceTests(unittest.TestCase):
         self.assertTrue(torch.allclose(parallel.state.working_state, sequential.state.working_state, atol=1e-4))
         self.assertTrue(torch.allclose(parallel.state.memory_basis, sequential.state.memory_basis, atol=1e-4))
         self.assertTrue(torch.allclose(parallel.state.memory_normalizer, sequential.state.memory_normalizer, atol=1e-4))
+        self.assertTrue(torch.allclose(parallel.state.refine_basis, sequential.state.refine_basis, atol=1e-4))
+        self.assertTrue(torch.allclose(parallel.state.refine_normalizer, sequential.state.refine_normalizer, atol=1e-4))
         self.assertTrue(torch.allclose(parallel.state.local_keys, sequential.state.local_keys, atol=1e-4))
         self.assertTrue(torch.equal(parallel.state.local_valid, sequential.state.local_valid))
+        self.assertTrue(torch.equal(parallel.state.last_token_ids, sequential.state.last_token_ids))
         self.assertEqual(parallel.state.step_index, sequential.state.step_index)
 
     def test_paths_agree_for_a_long_sequence(self) -> None:
@@ -72,8 +75,10 @@ class ExecutionEquivalenceTests(unittest.TestCase):
             parallel = model(input_ids, state, execution_mode=ExecutionMode.PARALLEL)
             sequential = model(input_ids, state, execution_mode=ExecutionMode.SEQUENTIAL)
         self.assertTrue(torch.allclose(parallel.logits, sequential.logits, atol=1e-4))
+        self.assertTrue(torch.allclose(parallel.state.refine_basis, sequential.state.refine_basis, atol=1e-4))
         self.assertTrue(torch.allclose(parallel.state.local_keys, sequential.state.local_keys, atol=1e-4))
         self.assertTrue(torch.equal(parallel.state.local_valid, sequential.state.local_valid))
+        self.assertTrue(torch.equal(parallel.state.last_token_ids, sequential.state.last_token_ids))
 
     def test_one_pass_agrees_with_step_by_step_decoding(self) -> None:
         torch.manual_seed(3)

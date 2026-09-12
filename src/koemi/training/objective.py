@@ -17,12 +17,13 @@ class TrainingObjective:
     total_loss: Tensor
 
 
-def token_cross_entropy(logits: Tensor, target_ids: Tensor) -> Tensor:
+def token_cross_entropy(logits: Tensor, target_ids: Tensor, label_smoothing: float = 0.0) -> Tensor:
     flat_loss = functional.cross_entropy(
         logits.reshape(-1, logits.shape[-1]),
         target_ids.reshape(-1),
         ignore_index=IGNORE_TARGET_ID,
         reduction="none",
+        label_smoothing=label_smoothing,
     )
     return flat_loss.view(target_ids.shape)
 
@@ -32,6 +33,7 @@ def calculate_training_objective(
     target_ids: Tensor,
     thinking_mask: Tensor,
     thinking_loss_weight: float,
+    label_smoothing: float = 0.0,
 ) -> TrainingObjective:
     if thinking_loss_weight < 0.0:
         raise ValueError("thinking_loss_weight must be non-negative")
@@ -41,7 +43,7 @@ def calculate_training_objective(
         raise ValueError("training objective requires at least one supervised target token")
     if thinking_mask.shape != target_ids.shape:
         raise ValueError("thinking_mask must have the same shape as target_ids")
-    token_loss = token_cross_entropy(output.logits, target_ids)
+    token_loss = token_cross_entropy(output.logits, target_ids, label_smoothing)
     task_loss = (token_loss * supervised_mask).sum() / supervised_count
     thinking_positions = supervised_mask & thinking_mask
     thinking_count = int(thinking_positions.sum())

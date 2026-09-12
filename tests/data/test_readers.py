@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 from koemi.data.contracts import DatasetValidationError
-from koemi.data.readers import load_dataset_records
+from koemi.data.readers import load_dataset_records, split_dataset_records
 
 
 class DatasetReaderTests(unittest.TestCase):
@@ -54,6 +54,28 @@ class DatasetReaderTests(unittest.TestCase):
         with self.temporary_json_file(records) as dataset_path:
             with self.assertRaisesRegex(DatasetValidationError, "thinking"):
                 load_dataset_records([dataset_path])
+
+    def test_loads_plain_text_and_splits_deterministically(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            text_path = directory / "document.txt"
+            text_path.write_text("A complete plain text training document.", encoding="utf-8")
+            json_path = directory / "records.json"
+            json_path.write_text(
+                json.dumps([{"id": "json", "input": "JSON document", "output": None}]), encoding="utf-8"
+            )
+            report = load_dataset_records([text_path, json_path])
+        first_split = split_dataset_records(report.records, 0.5, seed=7)
+        second_split = split_dataset_records(report.records, 0.5, seed=7)
+        self.assertEqual({"text": 1, "canonical": 1}, report.adapter_counts)
+        self.assertEqual(first_split, second_split)
+        self.assertEqual((1, 1), tuple(len(part) for part in first_split))
+
+    def test_validation_split_rejects_a_single_record(self) -> None:
+        with self.temporary_json_file([{"id": "one", "input": "text", "output": None}]) as dataset_path:
+            records = load_dataset_records([dataset_path]).records
+        with self.assertRaisesRegex(DatasetValidationError, "at least two"):
+            split_dataset_records(records, 0.2, seed=0)
 
     def temporary_json_file(self, records: list[object]):
         temporary_directory = tempfile.TemporaryDirectory()

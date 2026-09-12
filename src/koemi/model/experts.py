@@ -6,6 +6,11 @@ from torch import Tensor, nn
 from koemi.model.layers import GatedFeedForward, RootMeanSquareNorm
 
 
+TOKEN_HASH_FACTOR = 1_000_003
+PREVIOUS_TOKEN_HASH_FACTOR = 97_409
+POSITION_HASH_FACTOR = 65_537
+
+
 class DeterministicExpertMixture(nn.Module):
     def __init__(self, embedding_size: int, expert_count: int) -> None:
         super().__init__()
@@ -13,10 +18,22 @@ class DeterministicExpertMixture(nn.Module):
         self.experts = nn.ModuleList(GatedFeedForward(embedding_size) for _ in range(expert_count))
         self.output_normalizer = RootMeanSquareNorm(embedding_size)
 
-    def forward(self, context: Tensor, token_ids: Tensor, valid_mask: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(
+        self,
+        context: Tensor,
+        token_ids: Tensor,
+        previous_token_ids: Tensor,
+        positions: Tensor,
+        valid_mask: Tensor,
+    ) -> tuple[Tensor, Tensor]:
         if self.expert_count == 0:
             return context, torch.full_like(token_ids, -1)
-        assignment = token_ids.remainder(self.expert_count).masked_fill(~valid_mask, -1)
+        context_hash = (
+            token_ids * TOKEN_HASH_FACTOR
+            + previous_token_ids * PREVIOUS_TOKEN_HASH_FACTOR
+            + positions * POSITION_HASH_FACTOR
+        )
+        assignment = context_hash.remainder(self.expert_count).masked_fill(~valid_mask, -1)
         flattened_context = context.reshape(-1, context.shape[-1])
         flattened_assignment = assignment.reshape(-1)
         mixed_context = context.reshape(-1, context.shape[-1]).clone()

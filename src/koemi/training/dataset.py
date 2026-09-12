@@ -62,13 +62,28 @@ def create_training_loader(
     dataset: CausalByteDataset,
     batch_size: int,
     generator: torch.Generator | None = None,
+    *,
+    shuffle: bool = True,
+    num_workers: int = 0,
+    pin_memory: bool = False,
+    prefetch_factor: int = 2,
 ) -> DataLoader[CausalChunk]:
+    if num_workers < 0:
+        raise ValueError("num_workers must be non-negative")
+    if prefetch_factor < 1:
+        raise ValueError("prefetch_factor must be at least 1")
+    worker_options = {}
+    if num_workers > 0:
+        worker_options = {"prefetch_factor": prefetch_factor, "persistent_workers": True}
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=shuffle,
         collate_fn=collate_chunks,
         generator=generator,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        **worker_options,
     )
 
 

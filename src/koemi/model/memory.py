@@ -31,14 +31,22 @@ class BoundedRecurrentState(nn.Module):
 
 
 @dataclass(frozen=True)
+class MemoryProjection:
+    value: Tensor
+    features: Tensor
+    decay: Tensor
+    write_weight: Tensor
+
+
+@dataclass(frozen=True)
 class MemoryWriteTerms:
     decay: Tensor
     basis_increment: Tensor
     normalizer_increment: Tensor
 
 
-class AssociativeMemory(nn.Module):
-    def __init__(self, embedding_size: int, memory_features: int) -> None:
+class HierarchicalAssociativeMemory(nn.Module):
+    def __init__(self, embedding_size: int, memory_features: int, refine_decay_rate: float) -> None:
         super().__init__()
         self.key_projection = nn.Linear(embedding_size, embedding_size)
         self.query_projection = nn.Linear(embedding_size, embedding_size)
@@ -46,40 +54,64 @@ class AssociativeMemory(nn.Module):
         self.feature_projection = nn.Linear(embedding_size, memory_features)
         self.decay_projection = nn.Linear(embedding_size, 1)
         self.write_projection = nn.Linear(embedding_size, 1)
+        self.refine_decay_rate = refine_decay_rate
         self.minimum_decay = 2.0**-12
         self.maximum_decay = 1.0 - 2.0**-12
-        self.epsilon = 2.0**-6
+        self.maximum_refine_decay = 1.0 - 2.0**-16
+        self.epsilon = 2.0**-8
 
-    def read(self, memory_basis: Tensor, memory_normalizer: Tensor, query_source: Tensor) -> tuple[Tensor, Tensor]:
-        query = self.query_projection(query_source)
-        features = torch.softmax(self.feature_projection(query), dim=-1)
-        normalized_features = features / (memory_normalizer + self.epsilon)
-        memory_value = (memory_basis @ normalized_features.unsqueeze(-1)).squeeze(-1)
-        return memory_value, features
-
-    def write_terms(self, write_source: Tensor, surprise: Tensor | None = None) -> MemoryWriteTerms:
+    def project(self, write_source: Tensor) -> MemoryProjection:
         key = self.key_projection(write_source)
-        value = self.value_projection(write_source)
         features = torch.softmax(self.feature_projection(key), dim=-1)
+        value = torch.tanh(self.value_projection(write_source))
         decay = torch.sigmoid(self.decay_projection(write_source))
         bounded_decay = self.minimum_decay + (self.maximum_decay - self.minimum_decay) * decay
         write_weight = torch.sigmoid(self.write_projection(write_source)).squeeze(-1)
-        if surprise is not None:
-            write_weight = write_weight * (0.5 + surprise.clamp(0.0, 1.0))
+        return MemoryProjection(value, features, bounded_decay, write_weight)
+
+    def read(self, memory_basis: Tensor, memory_normalizer: Tensor, query_source: Tensor) -> tuple[Tensor, Tensor]:
+        query = self.query_projection(query_source)
+        query_features = torch.softmax(self.feature_projection(query), dim=-1)
+        numerator = (memory_basis @ query_features.unsqueeze(-1)).squeeze(-1)
+        denominator = (memory_normalizer * query_features).sum(dim=-1, keepdim=True)
+        return numerator / (denominator + self.epsilon), query_features
+
+    def fast_write_terms(self, projection: MemoryProjection, surprise: Tensor) -> MemoryWriteTerms:
+        write_weight = projection.write_weight * (0.25 + 0.75 * surprise.clamp(0.0, 1.0))
+        return self.write_terms(projection.decay, projection.value, projection.features, write_weight)
+
+    def refine_write_terms(
+        self,
+        projection: MemoryProjection,
+        reconstruction_error: Tensor,
+        surprise: Tensor,
+        novelty: Tensor,
+    ) -> MemoryWriteTerms:
+        refine_decay = 1.0 - (1.0 - projection.decay) * self.refine_decay_rate
+        refine_decay = refine_decay.clamp(max=self.maximum_refine_decay)
+        write_weight = projection.write_weight * surprise.clamp(0.0, 1.0) * novelty.clamp(0.0, 1.0)
+        bounded_error = reconstruction_error.clamp(-2.0, 2.0)
+        return self.write_terms(refine_decay, bounded_error, projection.features, write_weight)
+
+    def write_terms(
+        self,
+        decay: Tensor,
+        value: Tensor,
+        features: Tensor,
+        write_weight: Tensor,
+    ) -> MemoryWriteTerms:
         basis_increment = write_weight.unsqueeze(-1).unsqueeze(-1) * (
             value.unsqueeze(-1) @ features.unsqueeze(-2)
         )
-        normalizer_increment = write_weight.unsqueeze(-1) * features.pow(2)
-        return MemoryWriteTerms(bounded_decay, basis_increment, normalizer_increment)
+        normalizer_increment = write_weight.unsqueeze(-1) * features
+        return MemoryWriteTerms(decay, basis_increment, normalizer_increment)
 
-    def write(
+    def update(
         self,
         memory_basis: Tensor,
         memory_normalizer: Tensor,
-        write_source: Tensor,
-        surprise: Tensor | None = None,
+        terms: MemoryWriteTerms,
     ) -> tuple[Tensor, Tensor]:
-        terms = self.write_terms(write_source, surprise)
         next_basis = terms.decay.unsqueeze(-1) * memory_basis + terms.basis_increment
         next_normalizer = terms.decay * memory_normalizer + terms.normalizer_increment
         return next_basis, next_normalizer
@@ -181,7 +213,11 @@ class LocalKeyValueMemory(nn.Module):
         all_valid = torch.cat((carried_valid, valid_mask), dim=1)
         if all_keys.shape[1] <= self.local_memory_size:
             return all_keys, all_values, all_valid
-        return all_keys[:, -self.local_memory_size :], all_values[:, -self.local_memory_size :], all_valid[:, -self.local_memory_size :]
+        return (
+            all_keys[:, -self.local_memory_size :],
+            all_values[:, -self.local_memory_size :],
+            all_valid[:, -self.local_memory_size :],
+        )
 
     def append(
         self,
@@ -197,4 +233,8 @@ class LocalKeyValueMemory(nn.Module):
         next_valid = torch.cat((local_valid, valid.unsqueeze(1)), dim=1)
         if next_keys.shape[1] <= self.local_memory_size:
             return next_keys, next_values, next_valid
-        return next_keys[:, -self.local_memory_size :], next_values[:, -self.local_memory_size :], next_valid[:, -self.local_memory_size :]
+        return (
+            next_keys[:, -self.local_memory_size :],
+            next_values[:, -self.local_memory_size :],
+            next_valid[:, -self.local_memory_size :],
+        )

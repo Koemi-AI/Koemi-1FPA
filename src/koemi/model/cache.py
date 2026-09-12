@@ -6,6 +6,7 @@ import hashlib
 import os
 import pickle
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,8 @@ class CacheStatistics:
     hits: int
     misses: int
     evictions: int
+    expirations: int = 0
+    deletions: int = 0
 
 
 @dataclass(frozen=True)
@@ -105,26 +108,39 @@ class DiskMappingCache:
         self,
         directory: str | Path,
         capacity: int = 128,
-        namespace: str = "default",
+        namespace: str | None = None,
         max_entry_bytes: int = 64 * 1024 * 1024,
+        ttl_seconds: float = 3600.0,
     ) -> None:
         if capacity < 1:
             raise ValueError("disk cache capacity must be at least 1")
         if max_entry_bytes < 1:
             raise ValueError("disk cache max entry bytes must be at least 1")
+        if namespace is None or not namespace.strip():
+            raise ValueError("disk cache namespace is required")
+        if ttl_seconds <= 0.0:
+            raise ValueError("disk cache TTL must be positive")
         self.directory = Path(directory).expanduser().resolve()
         self.directory.mkdir(parents=True, exist_ok=True)
         self.capacity = capacity
         self.namespace = namespace
         self._namespace_digest = hashlib.blake2b(namespace.encode("utf-8"), digest_size=8).hexdigest()
         self.max_entry_bytes = max_entry_bytes
+        self.ttl_seconds = ttl_seconds
         self._hits = 0
         self._misses = 0
         self._evictions = 0
+        self._expirations = 0
+        self._deletions = 0
 
     def get(self, input_ids: Tensor, device: torch.device) -> CachedMapping | None:
         cache_path = self.path_for(input_ids)
         if not cache_path.exists() or not cache_path.is_file():
+            self._misses += 1
+            return None
+        if self.is_expired(cache_path):
+            cache_path.unlink(missing_ok=True)
+            self._expirations += 1
             self._misses += 1
             return None
         try:
@@ -147,9 +163,12 @@ class DiskMappingCache:
             "working_state": mapping.state.working_state.detach().cpu(),
             "memory_basis": mapping.state.memory_basis.detach().cpu(),
             "memory_normalizer": mapping.state.memory_normalizer.detach().cpu(),
+            "refine_basis": mapping.state.refine_basis.detach().cpu(),
+            "refine_normalizer": mapping.state.refine_normalizer.detach().cpu(),
             "local_keys": mapping.state.local_keys.detach().cpu(),
             "local_values": mapping.state.local_values.detach().cpu(),
             "local_valid": mapping.state.local_valid.detach().cpu(),
+            "last_token_ids": mapping.state.last_token_ids.detach().cpu(),
             "step_index": mapping.state.step_index,
             "surprise_values": mapping.surprise_values.detach().cpu(),
             "expert_indices": mapping.expert_indices.detach().cpu(),
@@ -168,6 +187,7 @@ class DiskMappingCache:
         finally:
             if temporary_path.exists():
                 temporary_path.unlink()
+        self.purge_expired()
         self.evict_old_entries()
 
     def estimate_mapping_bytes(self, mapping: CachedMapping) -> int:
@@ -176,9 +196,12 @@ class DiskMappingCache:
             mapping.state.working_state,
             mapping.state.memory_basis,
             mapping.state.memory_normalizer,
+            mapping.state.refine_basis,
+            mapping.state.refine_normalizer,
             mapping.state.local_keys,
             mapping.state.local_values,
             mapping.state.local_valid,
+            mapping.state.last_token_ids,
             mapping.surprise_values,
             mapping.expert_indices,
             mapping.valid_positions,
@@ -202,6 +225,42 @@ class DiskMappingCache:
             oldest_path.unlink()
             self._evictions += 1
 
+    def is_expired(self, cache_path: Path, current_time: float | None = None) -> bool:
+        now = time.time() if current_time is None else current_time
+        return now - cache_path.stat().st_mtime > self.ttl_seconds
+
+    def purge_expired(self) -> int:
+        expired_count = 0
+        for cache_path in self.namespace_files():
+            if self.is_expired(cache_path):
+                cache_path.unlink(missing_ok=True)
+                expired_count += 1
+        self._expirations += expired_count
+        return expired_count
+
+    def delete(self, input_ids: Tensor) -> bool:
+        cache_path = self.path_for(input_ids)
+        if not cache_path.exists():
+            return False
+        cache_path.unlink()
+        self._deletions += 1
+        return True
+
+    def clear(self) -> int:
+        deletion_count = 0
+        for cache_path in self.namespace_files():
+            cache_path.unlink(missing_ok=True)
+            deletion_count += 1
+        self._deletions += deletion_count
+        return deletion_count
+
+    def namespace_files(self) -> tuple[Path, ...]:
+        return tuple(
+            path
+            for path in self.directory.glob(f"koemi-mapping-{self._namespace_digest}-*.pt")
+            if path.is_file()
+        )
+
     def validate_payload(self, payload: Any) -> CachedMapping:
         if not isinstance(payload, dict) or payload.get("format_version") != 1:
             raise ValueError("disk cache entry format is invalid")
@@ -210,9 +269,12 @@ class DiskMappingCache:
             "working_state",
             "memory_basis",
             "memory_normalizer",
+            "refine_basis",
+            "refine_normalizer",
             "local_keys",
             "local_values",
             "local_valid",
+            "last_token_ids",
             "surprise_values",
             "expert_indices",
             "valid_positions",
@@ -232,19 +294,28 @@ class DiskMappingCache:
             raise ValueError("disk cache entry working state is invalid")
         if payload["memory_basis"].ndim != 3 or payload["memory_normalizer"].ndim != 2:
             raise ValueError("disk cache entry associative state is invalid")
+        if payload["refine_basis"].shape != payload["memory_basis"].shape:
+            raise ValueError("disk cache entry refine basis is invalid")
+        if payload["refine_normalizer"].shape != payload["memory_normalizer"].shape:
+            raise ValueError("disk cache entry refine normalizer is invalid")
         if payload["local_keys"].ndim != 3 or payload["local_values"].shape != payload["local_keys"].shape:
             raise ValueError("disk cache entry local state is invalid")
         if payload["local_valid"].shape != payload["local_keys"].shape[:2]:
             raise ValueError("disk cache entry local mask is invalid")
+        if payload["last_token_ids"].shape != (output_shape[0],):
+            raise ValueError("disk cache entry context tokens are invalid")
         if payload["token_count"] < 0 or payload["token_count"] > int(payload["valid_positions"].sum()):
             raise ValueError("disk cache entry token count is invalid")
         state = KoemiState(
             working_state=payload["working_state"],
             memory_basis=payload["memory_basis"],
             memory_normalizer=payload["memory_normalizer"],
+            refine_basis=payload["refine_basis"],
+            refine_normalizer=payload["refine_normalizer"],
             local_keys=payload["local_keys"],
             local_values=payload["local_values"],
             local_valid=payload["local_valid"].to(dtype=torch.bool),
+            last_token_ids=payload["last_token_ids"].to(dtype=torch.long),
             step_index=int(payload["step_index"]),
         )
         return CachedMapping(
@@ -257,4 +328,6 @@ class DiskMappingCache:
         )
 
     def statistics(self) -> CacheStatistics:
-        return CacheStatistics(self._hits, self._misses, self._evictions)
+        return CacheStatistics(
+            self._hits, self._misses, self._evictions, self._expirations, self._deletions
+        )

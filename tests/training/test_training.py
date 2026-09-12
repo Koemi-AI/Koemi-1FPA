@@ -12,7 +12,7 @@ from koemi.data.contracts import DatasetRecord
 from koemi.data.tokenizer import ByteTokenizer
 from koemi.model.network import KoemiModel
 from koemi.training.checkpoints import CheckpointStore
-from koemi.training.dataset import CausalByteDataset, create_training_loader
+from koemi.training.dataset import CausalByteDataset, IGNORE_TARGET_ID, create_training_loader
 from koemi.training.generation import generate_text
 from koemi.training.trainer import Trainer
 
@@ -80,3 +80,49 @@ class TrainingTests(unittest.TestCase):
     def test_training_settings_reject_negative_thinking_weight(self) -> None:
         with self.assertRaises(ValueError):
             TrainingSettings(thinking_loss_weight=-1.0)
+
+    def test_accumulation_scheduler_validation_and_precision_metrics(self) -> None:
+        torch.manual_seed(0)
+        dataset = CausalByteDataset(build_records(), sequence_length=32)
+        counting_loader = create_training_loader(dataset, batch_size=1, shuffle=False)
+        supervised_batches = sum(
+            int((batch["target_ids"] != IGNORE_TARGET_ID).any()) for batch in counting_loader
+        )
+        training_loader = create_training_loader(dataset, batch_size=1, generator=torch.Generator().manual_seed(0))
+        validation_loader = create_training_loader(dataset, batch_size=2, shuffle=False)
+        result = Trainer(logging.getLogger("koemi-test")).train(
+            build_model(expert_count=0),
+            training_loader,
+            TrainingSettings(
+                sequence_length=32,
+                batch_size=1,
+                epochs=1,
+                device="cpu",
+                precision="auto",
+                gradient_accumulation_steps=2,
+                warmup_steps=1,
+                label_smoothing=0.05,
+            ),
+            validation_loader,
+        )
+        self.assertEqual("fp32", result.precision)
+        self.assertEqual((supervised_batches + 1) // 2, result.optimizer_steps)
+        self.assertIsNotNone(result.validation_loss)
+        self.assertIsNotNone(result.validation_perplexity)
+        self.assertGreater(result.tokens_per_second, 0.0)
+
+    def test_fp16_training_rejects_cpu(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires CUDA"):
+            Trainer.resolve_precision(torch.device("cpu"), "fp16")
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA unavailable")
+    def test_cuda_auto_precision_training_path(self) -> None:
+        dataset = CausalByteDataset(build_records(), sequence_length=32)
+        loader = create_training_loader(dataset, batch_size=2, pin_memory=True)
+        result = Trainer(logging.getLogger("koemi-test")).train(
+            build_model(expert_count=0),
+            loader,
+            TrainingSettings(sequence_length=32, batch_size=2, epochs=1, device="cuda", precision="auto"),
+        )
+        self.assertIn(result.precision, {"bf16", "fp16"})
+        self.assertGreater(result.optimizer_steps, 0)

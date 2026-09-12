@@ -160,10 +160,12 @@ def match_hidden_size(cell_name: str, embedding_size: int, target_parameter_coun
 
 def koemi_state_bytes(settings: ModelSettings) -> int:
     embedding_size = settings.embedding_size
-    state_scalars = embedding_size + embedding_size * settings.memory_features + settings.memory_features
+    associative_scalars = embedding_size * settings.memory_features + settings.memory_features
+    state_scalars = embedding_size + 2 * associative_scalars
     local_bytes = 2 * settings.local_memory_size * embedding_size * 4
     valid_bytes = settings.local_memory_size
-    return state_scalars * 4 + local_bytes + valid_bytes
+    last_token_bytes = 8
+    return state_scalars * 4 + local_bytes + valid_bytes + last_token_bytes
 
 
 def evaluate_baseline(model: RecurrentBaseline, loader: DataLoader) -> tuple[float, float, int]:

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import unittest
 import tempfile
+import os
+import time
 from pathlib import Path
 
 import torch
@@ -28,14 +30,40 @@ class KoemiModelTests(unittest.TestCase):
         self.assertEqual((), output.expert_activation_counts)
         self.assertTrue(torch.equal(output.expert_indices, torch.full_like(input_ids, -1)))
 
-    def test_backpropagates_through_the_predictor_and_surprise_write(self) -> None:
+    def test_backpropagates_through_output_and_refine_memory(self) -> None:
         model = self.build_model()
         input_ids = torch.tensor([[65, 66, 67]], dtype=torch.long)
         output = model(input_ids)
         output.logits.sum().backward()
         self.assertIsNotNone(model.token_predictor.weight.grad)
-        self.assertIsNotNone(model.surprise_projection.weight.grad)
-        self.assertTrue(torch.isfinite(model.token_predictor.weight.grad).all())
+        self.assertIsNotNone(model.memory_refine_gate.weight.grad)
+        self.assertTrue(torch.isfinite(model.embedding.weight.grad).all())
+        self.assertGreater(float(output.state.refine_basis.detach().abs().sum()), 0.0)
+
+    def test_surprise_is_the_causal_error_of_the_observed_token(self) -> None:
+        model = self.build_model()
+        with torch.no_grad():
+            model.token_predictor.weight.zero_()
+            model.token_predictor.bias.zero_()
+            model.token_predictor.bias[65] = 12.0
+        prior_states = torch.zeros(1, 2, model.settings.embedding_size)
+        input_ids = torch.tensor([[65, 66]], dtype=torch.long)
+        surprise = model.calculate_surprise(prior_states, input_ids, torch.ones_like(input_ids, dtype=torch.bool))
+        self.assertLess(float(surprise[0, 0].detach()), float(surprise[0, 1].detach()))
+
+    def test_refine_memory_retains_more_slowly_than_fast_memory(self) -> None:
+        model = self.build_model()
+        projection = model.associative_memory.project(torch.randn(2, model.settings.embedding_size))
+        surprise = torch.full((2,), 0.75)
+        fast_terms = model.associative_memory.fast_write_terms(projection, surprise)
+        refine_terms = model.associative_memory.refine_write_terms(
+            projection,
+            torch.randn_like(projection.value),
+            surprise,
+            torch.ones_like(surprise),
+        )
+        self.assertTrue(torch.all(refine_terms.decay >= fast_terms.decay))
+        self.assertTrue(torch.isfinite(refine_terms.basis_increment).all())
 
     def test_padding_is_not_written_as_a_valid_local_entry(self) -> None:
         torch.manual_seed(0)
@@ -50,8 +78,8 @@ class KoemiModelTests(unittest.TestCase):
         model = self.build_model(expert_count=4)
         input_ids = torch.tensor([[65, 66, 67, PAD_TOKEN_ID]], dtype=torch.long)
         output = model(input_ids)
-        self.assertEqual([0, 1, 1, 1], list(output.expert_activation_counts))
-        self.assertEqual([1, 2, 3, -1], output.expert_indices[0].tolist())
+        self.assertEqual([1, 1, 0, 1], list(output.expert_activation_counts))
+        self.assertEqual([3, 0, 1, -1], output.expert_indices[0].tolist())
         self.assertEqual(3, sum(output.expert_activation_counts))
 
     def test_warm_cache_preserves_logits_and_reports_reuse(self) -> None:
@@ -81,7 +109,7 @@ class KoemiModelTests(unittest.TestCase):
         model.eval()
         input_ids = torch.tensor([[65, 66, 67]], dtype=torch.long)
         with tempfile.TemporaryDirectory() as temporary_directory:
-            cache = DiskMappingCache(Path(temporary_directory), capacity=1)
+            cache = DiskMappingCache(Path(temporary_directory), capacity=1, namespace="test")
             first = model(input_ids, mapping_cache=cache)
             second = model(input_ids, mapping_cache=cache)
             statistics = cache.statistics()
@@ -100,7 +128,7 @@ class KoemiModelTests(unittest.TestCase):
             cache_directory = Path(temporary_directory)
             foreign_file = cache_directory / "foreign.pt"
             foreign_file.write_bytes(b"keep")
-            cache = DiskMappingCache(cache_directory, capacity=1)
+            cache = DiskMappingCache(cache_directory, capacity=1, namespace="test")
             model(first_ids, mapping_cache=cache)
             model(second_ids, mapping_cache=cache)
             self.assertTrue(foreign_file.exists())
@@ -126,6 +154,30 @@ class KoemiModelTests(unittest.TestCase):
         model.eval()
         input_ids = torch.tensor([[65, 66, 67]], dtype=torch.long)
         with tempfile.TemporaryDirectory() as temporary_directory:
-            cache = DiskMappingCache(Path(temporary_directory), max_entry_bytes=1)
+            cache = DiskMappingCache(Path(temporary_directory), namespace="test", max_entry_bytes=1)
             model(input_ids, mapping_cache=cache)
             self.assertFalse(cache.path_for(input_ids).exists())
+
+    def test_disk_mapping_cache_requires_isolation_namespace(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with self.assertRaisesRegex(ValueError, "namespace"):
+                DiskMappingCache(Path(temporary_directory))
+
+    def test_disk_mapping_cache_expires_and_deletes_only_its_namespace(self) -> None:
+        model = self.build_model()
+        model.eval()
+        input_ids = torch.tensor([[65, 66, 67]], dtype=torch.long)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            cache_directory = Path(temporary_directory)
+            cache = DiskMappingCache(cache_directory, namespace="tenant-a", ttl_seconds=1.0)
+            other = DiskMappingCache(cache_directory, namespace="tenant-b", ttl_seconds=1.0)
+            model(input_ids, mapping_cache=cache)
+            model(input_ids, mapping_cache=other)
+            old_time = time.time() - 10.0
+            os.utime(cache.path_for(input_ids), (old_time, old_time))
+            self.assertIsNone(cache.get(input_ids, torch.device("cpu")))
+            self.assertEqual(1, cache.statistics().expirations)
+            self.assertEqual(0, cache.clear())
+            self.assertTrue(other.path_for(input_ids).exists())
+            self.assertTrue(other.delete(input_ids))
+            self.assertEqual(1, other.statistics().deletions)

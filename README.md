@@ -1,8 +1,8 @@
 # Koemi-2OBOV
 
 Koemi-2OBOV is a PyTorch training base for byte-level causal models built on
-KSM (Koemi State Memory): bounded recurrent state, associative memory, local
-exact recall and optional fixed-dispatch experts.
+HERM (Hierarchical Error-Refined Memory): bounded recurrent state, fast and
+slow associative memory, local exact recall and optional deterministic experts.
 
 This repository contains architecture and training code. It does not ship a
 trained model and does not claim Transformer-level quality.
@@ -10,7 +10,7 @@ trained model and does not claim Transformer-level quality.
 ## Problem
 
 Large attention models spend memory and compute repeatedly processing context.
-KSM keeps a bounded state for the running sequence, a small exact local buffer,
+HERM keeps bounded fast and slow states for the running sequence, a small exact local buffer,
 and an associative state that can be updated with a parallel affine scan.
 
 ## Install
@@ -27,7 +27,7 @@ On Windows, replace `.venv/bin/python` with `.venv\Scripts\python`.
 
 ## Dataset contract
 
-The loader accepts `.json` arrays and `.jsonl` files. A normalized record uses
+The loader accepts UTF-8 `.txt`, `.json` arrays and `.jsonl` files. A normalized record uses
 this shape:
 
 ```json
@@ -67,7 +67,10 @@ verification.
 ```
 
 Training logs contain loss, thinking loss, surprise, valid-token count and
-expert activations. Example content is never logged.
+expert activations. Validation loss/perplexity, optimizer steps, learning rate,
+precision and tokens/s are also reported. AdamW, warmup/cosine decay, gradient
+accumulation, label smoothing and AMP are configured through CLI flags. Example
+content is never logged.
 
 ## Generate
 
@@ -77,14 +80,16 @@ expert activations. Example content is never logged.
   --prompt "FIFO means" \
   --max-new-bytes 64 \
   --cache-capacity 256 \
-  --mapping-cache D:\\koemi-cache
+  --mapping-cache D:\\koemi-cache \
+  --mapping-cache-namespace local-session \
+  --mapping-cache-ttl-seconds 3600
 ```
 
 The RAM cache reuses detached embeddings by token id. The optional mapping
-cache stores the output and recurrent state for an exact input sequence under a
-checkpoint namespace and content hash. It is suitable for repeated identical prompts, not semantic
-similarity. Use a dedicated SSD directory and clear it when its retention is no
-longer acceptable.
+cache stores the output and recurrent state for an exact input sequence under an
+explicit tenant/session plus checkpoint namespace and content hash. Entries
+expire under a sliding TTL and can be cleared only inside that namespace. It is
+suitable for repeated identical prompts, not semantic similarity.
 
 ## Architecture
 
@@ -94,45 +99,57 @@ flowchart LR
     Warm[RAM token cache] -.-> Embedding
     Disk[Optional SSD mapping cache] -. exact sequence .-> Output
     Embedding --> Recurrent[Bounded recurrent state]
-    Recurrent --> Associative[Associative memory]
+    Recurrent --> Fast[Fast associative memory]
+    Fast --> Residual[Reconstruction residual]
+    Residual --> Slow[Slow refine memory]
     Recurrent --> Local[Exact local KV ring]
     Recurrent --> Surprise[Linear causal surprise]
-    Surprise --> Associative
-    Associative --> Fusion[Linear fusion]
+    Surprise --> Fast
+    Surprise --> Slow
+    Fast --> Fusion[Linear fusion]
+    Slow --> Fusion
     Local --> Fusion
     Recurrent --> Fusion
-    Fusion --> MoE[Optional fixed-dispatch MoE]
+    Fusion --> MoE[Optional contextual deterministic MoE]
     MoE --> Output[Linear byte predictor]
 ```
 
-### KSM memory choices
+### HERM memory choices
 
-KSM uses four decisions inspired by the memory perspective in [MIRAS](https://research.google/blog/titans-miras-helping-ai-have-long-term-memory/):
+HERM uses four decisions inspired by the memory perspective in [MIRAS](https://research.google/blog/titans-miras-helping-ai-have-long-term-memory/):
 
-- memory architecture: bounded vector state, diagonal associative state and a
-  fixed local key-value ring;
+- memory architecture: bounded vector state, fast and slow normalized
+  associative matrices and a fixed local key-value ring;
 - attentional bias: key/query feature similarity and local dot-product recall;
 - retention gate: bounded decay with a learned write gate;
-- memory algorithm: differentiable outer training plus affine prefix scan.
+- memory algorithm: differentiable outer training plus two affine prefix scans.
 
 The current implementation is a research base, not a reimplementation of
 Titans. The Google overview identifies Titans as a concrete architecture and
 MIRAS as the broader framework; Titans uses a deeper online-updated neural
-memory than KSM currently does.
+memory than HERM does.
+
+For positive features `phi`, the fast tier reads
+`B_t phi(q) / (z_t dot phi(q) + epsilon)` and updates with
+`B_t = lambda_t B_(t-1) + w_t v_t phi(k_t)^T`. The slow tier receives the
+bounded reconstruction residual `v_t - read_fast_t`, decays more slowly with
+`lambda_s = 1 - (1 - lambda_t) rho`, and writes only in proportion to causal
+surprise and local novelty. State remains fixed-width and both recurrences are
+compatible with the same affine scan oracle.
 
 ### Surprise and chains
 
-The recurrent state creates a cheap linear preview. A scalar surprise estimate
-from that preview scales the next associative write. It does not select an
-execution path. A carried `KoemiState` is the chain between generation steps;
-resetting it starts a new session.
+The previous recurrent state predicts the observed byte. Surprise is
+`1 - exp(-NLL/log(256))`; it scales memory writes but never selects an execution
+path. A carried `KoemiState` is the chain between generation steps; resetting it
+starts a new session.
 
-### Fixed-dispatch MoE
+### Contextual deterministic MoE
 
-When `--expert-count` is greater than zero, token `id % expert_count` selects
-one expert. There is no risk head, top-k selector, routing projection or
-routing loss. This keeps work predictable and supports MoE training, but it
-does not provide learned semantic expert selection.
+When `--expert-count` is greater than zero, a stable hash of current byte,
+previous byte and absolute position selects one expert. There is no risk head,
+top-k selector, routing projection or routing loss. This partitions contexts
+more finely than byte-only dispatch, but it is not learned semantic routing.
 
 ## Configuration
 
@@ -141,10 +158,15 @@ does not provide learned semantic expert selection.
 | `--embedding-size` | `64` | Width of token embeddings and recurrent state. |
 | `--memory-features` | `16` | Width of associative memory features. |
 | `--local-memory-size` | `16` | Number of exact local key-value slots. |
-| `--expert-count` | `0` | Fixed-dispatch expert count; zero disables MoE. |
+| `--expert-count` | `0` | Context-hash expert count; zero disables MoE. |
 | `--cache-capacity` | `256` | Maximum RAM token embeddings. |
 | `--scan-chunk` | `128` | Sequence bucket used by the parallel path. |
+| `--refine-decay-rate` | `0.0625` | Slow-memory timescale relative to fast decay. |
 | `--thinking-loss-weight` | `1.0` | Relative weight of supervised thinking bytes. |
+| `--gradient-accumulation-steps` | `1` | Microbatches per optimizer update. |
+| `--precision` | `auto` | FP32 on CPU; BF16 or FP16 AMP on supported CUDA. |
+| `--validation-fraction` | `0.0` | Deterministic record-level holdout fraction. |
+| `--num-workers` | `0` | DataLoader worker processes. |
 | `--device` | CUDA if available | PyTorch device used for training or generation. |
 | `--execution-mode` | `parallel` | `parallel` scan or sequential correctness path. |
 
@@ -162,21 +184,24 @@ run has enough data for at least one model to solve the recall task.
 
 ## Known limitations
 
-- Fixed-dispatch experts are not learned semantic routing.
+- Contextual deterministic experts are not learned semantic routing. Learned
+  expert selection would reintroduce a router, contrary to this architecture.
 - The disk cache reuses exact hashed sequences only; “similar question” reuse
   needs retrieval and a similarity contract outside this phase.
 - Disk entries contain recurrent state and logits and can encode prompt content.
-  The cache is opt-in and should remain session-scoped until TTL, deletion and
-  tenant controls exist.
+  The cache is opt-in, requires an explicit namespace and provides TTL,
+  namespace-local deletion and size/capacity limits. Payload encryption is not
+  provided.
 - SSD storage avoids recomputing an exact cached sequence but cannot replace
   GPU or RAM for arbitrary active computation; I/O latency can dominate on an
   HDD.
-- There is no `asyncio` cognition scheduler or arbitrary layer offload. KSM's
+- There is no `asyncio` cognition scheduler or arbitrary layer offload. HERM's
   concurrency is tensor-level parallelism inside the causal scan window.
-- The diagonal associative memory may lose multi-key interactions. MQAR and
+- The two associative tiers may still lose multi-key interactions. MQAR and
   long-context recall are still required.
 - UTF-8 byte tokenization uses more positions than a learned tokenizer.
-- No distributed training, persistent episodic memory or tool use exists.
+- No Triton kernel, distributed training, semantic retrieval, persistent
+  episodic memory or tool use exists.
 
 ## Project layout
 
@@ -184,7 +209,7 @@ run has enough data for at least one model to solve the recall task.
 src/koemi/
   configuration/  Model and training settings
   data/           JSON validation, adapters, serialization and tokenizer
-  model/          KSM state, memory, cache, scan and fixed-dispatch MoE
+  model/          HERM state, memory, cache, scan and deterministic MoE
   training/       Causal chunks, objective, trainer, checkpoint and generation
 benchmarks/       OBOV against parameter-matched GRU and LSTM baselines
 tests/            Data, model, cache, execution and training contracts
