@@ -10,6 +10,9 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = ["numpy>=2.1", "torch>=2.8"]
 
+[project.optional-dependencies]
+datasets = ["datasets>=3.0"]
+
 [project.scripts]
 koemi = "koemi.cli:main"
 
