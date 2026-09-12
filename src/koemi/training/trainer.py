@@ -83,6 +83,7 @@ class Trainer:
         validation_seconds_inside_elapsed = 0.0
         parameters_receiving_gradient = 0
         learning_rate_by_epoch: list[EpochLearningRate] = []
+        final_validation: MetricAccumulator | None = None
         start_time = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
         for epoch_index in range(1, settings.epochs + 1):
@@ -132,6 +133,7 @@ class Trainer:
                     model, validation_loader, settings, device, execution_mode, autocast_dtype
                 )
                 validation_seconds_inside_elapsed += time.perf_counter() - validation_start_time
+                final_validation = validation
             self.logger.info(
                 "epoch_completed epoch=%s loss=%.6f task_loss=%.6f thinking_loss=%.6f surprise=%.4f "
                 "validation_loss=%s validation_perplexity=%s learning_rate=%.8f optimizer_steps=%s "
@@ -152,11 +154,6 @@ class Trainer:
             )
             accumulator.merge(epoch_metrics)
         elapsed_seconds = time.perf_counter() - start_time
-        final_validation = (
-            self.evaluate(model, validation_loader, settings, device, execution_mode, autocast_dtype)
-            if validation_loader is not None
-            else None
-        )
         telemetry = RunTelemetry(
             elapsed_seconds=elapsed_seconds,
             validation_seconds_inside_elapsed=validation_seconds_inside_elapsed,

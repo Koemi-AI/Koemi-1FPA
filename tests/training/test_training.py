@@ -30,7 +30,34 @@ def build_model(**overrides) -> KoemiModel:
     return KoemiModel(ModelSettings(**settings))
 
 
+class CountingTrainer(Trainer):
+    def __init__(self) -> None:
+        super().__init__(logging.getLogger("koemi-counting-test"))
+        self.evaluation_calls = 0
+
+    def evaluate(self, *args, **kwargs):
+        self.evaluation_calls += 1
+        return super().evaluate(*args, **kwargs)
+
+
 class TrainingTests(unittest.TestCase):
+    def test_validation_runs_once_per_epoch_and_reuses_last_result(self) -> None:
+        torch.manual_seed(0)
+        dataset = CausalByteDataset(build_records(), sequence_length=32)
+        training_loader = create_training_loader(dataset, batch_size=2)
+        validation_loader = create_training_loader(dataset, batch_size=2, shuffle=False)
+        trainer = CountingTrainer()
+
+        result = trainer.train(
+            build_model(expert_count=0),
+            training_loader,
+            TrainingSettings(sequence_length=32, batch_size=2, epochs=2, device="cpu"),
+            validation_loader,
+        )
+
+        self.assertEqual(2, trainer.evaluation_calls)
+        self.assertIsNotNone(result.validation_loss)
+
     def test_trains_saves_loads_and_generates_with_moe_and_thinking(self) -> None:
         torch.manual_seed(0)
         tokenizer = ByteTokenizer()
