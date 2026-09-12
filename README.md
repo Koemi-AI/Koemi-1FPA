@@ -167,6 +167,7 @@ more finely than byte-only dispatch, but it is not learned semantic routing.
 | `--precision` | `auto` | FP32 on CPU; BF16 or FP16 AMP on supported CUDA. |
 | `--validation-fraction` | `0.0` | Deterministic record-level holdout fraction. |
 | `--num-workers` | `0` | DataLoader worker processes. |
+| `--ablation` | `herm` | `herm`, `no_refine`, `no_surprise` or `affine` control. |
 | `--device` | CUDA if available | PyTorch device used for training or generation. |
 | `--execution-mode` | `parallel` | `parallel` scan or sequential correctness path. |
 
@@ -175,12 +176,14 @@ more finely than byte-only dispatch, but it is not learned semantic routing.
 ```bash
 .venv/bin/python benchmarks/run_benchmark.py --task bytes --report artifacts/bench-bytes-obov.json
 .venv/bin/python benchmarks/run_benchmark.py --task recall --report artifacts/bench-recall-obov.json
+.venv/bin/python benchmarks/run_ablation.py --task recall --seeds 17 29 41 --train-records 1024 --evaluation-records 1024 --epochs 4 --report artifacts/ablation-recall.json
 ```
 
 The harness compares OBOV with parameter-matched GRU and LSTM baselines. The
 old Koemi-1FPA measurements remain archived in [`docs/BENCHMARK.md`](docs/BENCHMARK.md)
-and are not OBOV results. No OBOV quality or speed claim is made until a new
-run has enough data for at least one model to solve the recall task.
+and are not OBOV results. The ablation runner requires at least three seeds and
+reports mean and standard deviation. The affine control is the minimum quality
+baseline; a small-budget single-seed run is not evidence of memory capacity.
 
 ## Known limitations
 

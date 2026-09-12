@@ -273,6 +273,7 @@ def run_single_model(arguments: argparse.Namespace) -> BenchmarkReport:
         memory_features=arguments.memory_features,
         local_memory_size=arguments.local_memory_size,
         expert_count=arguments.expert_count,
+        ablation=arguments.ablation,
     )
     koemi_parameter_count, koemi_parameter_bytes = count_parameter_bytes(KoemiModel(model_settings))
     torch.manual_seed(arguments.seed)
@@ -363,6 +364,7 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--memory-features", type=int, default=12)
     parser.add_argument("--local-memory-size", type=int, default=12)
     parser.add_argument("--expert-count", type=int, default=0)
+    parser.add_argument("--ablation", choices=("herm", "no_refine", "no_surprise", "affine"), default="herm")
     parser.add_argument("--report", default=None)
     return parser
 

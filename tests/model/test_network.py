@@ -10,6 +10,7 @@ import torch
 
 from koemi.configuration.settings import ModelSettings, PAD_TOKEN_ID
 from koemi.model.cache import DiskMappingCache, WarmTokenCache
+from koemi.model.execution import ExecutionMode
 from koemi.model.network import KoemiModel
 
 
@@ -29,6 +30,23 @@ class KoemiModelTests(unittest.TestCase):
         self.assertEqual(6, output.token_count)
         self.assertEqual((), output.expert_activation_counts)
         self.assertTrue(torch.equal(output.expert_indices, torch.full_like(input_ids, -1)))
+
+    def test_affine_ablation_is_a_memory_free_control(self) -> None:
+        model = self.build_model(ablation="affine", expert_count=4)
+        input_ids = torch.tensor([[65, 66, 67]], dtype=torch.long)
+        output = model(input_ids)
+        self.assertTrue(torch.isfinite(output.logits).all())
+        self.assertEqual((), output.expert_activation_counts)
+        self.assertTrue(torch.equal(output.state.memory_basis, torch.zeros_like(output.state.memory_basis)))
+        self.assertTrue(torch.equal(output.surprise_values, torch.zeros_like(output.surprise_values)))
+
+    def test_ablation_parallel_and_sequential_paths_agree(self) -> None:
+        model = self.build_model(ablation="no_refine")
+        input_ids = torch.tensor([[65, 66, 67, 68]], dtype=torch.long)
+        parallel = model(input_ids)
+        sequential = model(input_ids, execution_mode=ExecutionMode.SEQUENTIAL)
+        self.assertTrue(torch.allclose(parallel.logits, sequential.logits, atol=1e-5))
+        self.assertTrue(torch.allclose(parallel.state.memory_basis, sequential.state.memory_basis, atol=1e-5))
 
     def test_backpropagates_through_output_and_refine_memory(self) -> None:
         model = self.build_model()

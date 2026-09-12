@@ -20,6 +20,7 @@ class ModelSettings:
     cache_capacity: int = 256
     scan_chunk: int = 128
     refine_decay_rate: float = 0.0625
+    ablation: str = "herm"
 
     def __post_init__(self) -> None:
         if self.vocabulary_size != BYTE_VOCABULARY_SIZE + 1:
@@ -38,6 +39,8 @@ class ModelSettings:
             raise ValueError("cache_capacity must be at least 1")
         if not 0.0 < self.refine_decay_rate <= 1.0:
             raise ValueError("refine_decay_rate must be greater than zero and at most one")
+        if self.ablation not in {"herm", "no_refine", "no_surprise", "affine"}:
+            raise ValueError("ablation must be herm, no_refine, no_surprise or affine")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

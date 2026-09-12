@@ -100,6 +100,7 @@ def add_model_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--cache-capacity", type=int, default=256)
     parser.add_argument("--scan-chunk", type=int, default=128)
     parser.add_argument("--refine-decay-rate", type=float, default=0.0625)
+    parser.add_argument("--ablation", choices=("herm", "no_refine", "no_surprise", "affine"), default="herm")
 
 
 def inspect_dataset(arguments: argparse.Namespace, logger) -> int:
@@ -253,6 +254,7 @@ def create_model_settings(arguments: argparse.Namespace) -> ModelSettings:
         cache_capacity=arguments.cache_capacity,
         scan_chunk=arguments.scan_chunk,
         refine_decay_rate=arguments.refine_decay_rate,
+        ablation=arguments.ablation,
     )
 
 

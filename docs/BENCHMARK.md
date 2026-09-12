@@ -67,15 +67,29 @@ deviation. This demonstrates that the current graph can memorize a small set,
 while exposing substantial initialization variance. It does not prove
 generalization or long-context memory.
 
-### Current conclusion
+### Three-seed ablation at a usable training budget
 
-With an adequate standard error, HERM recall is `7.833 bpb` against the random
-ceiling of `8.0`. The overfit check confirms that the graph trains, so the
-result is not explained by blocked gradients; the associative memory simply is
-not learning the task that is supposed to justify it. The first ablation must
-be affine recurrence plus prediction head alone, followed by slow memory and
-refine, surprise, fast memory, local attention and deterministic MoE. Each
-configuration requires at least three seeds.
+The ablation runner used 1,024 training records, 1,024 evaluation records,
+three seeds (`17, 29, 41`) and four epochs. Every configuration evaluated the
+same 3,072 supervised bytes:
+
+| Configuration | Mean bpb | Seed standard deviation | Mean train tok/s | Mean eval tok/s |
+| --- | ---: | ---: | ---: | ---: |
+| affine + head | 5.033 | 0.023 | 2,290.5 | 4,844.1 |
+| HERM | 4.817 | 0.014 | 236.3 | 818.6 |
+| HERM without refine | 4.817 | 0.014 | 430.2 | 1,107.2 |
+| HERM without surprise | 4.816 | 0.015 | 268.5 | 909.9 |
+
+The fast associative tier accounts for the meaningful improvement over the
+affine control. Refine and surprise do not yet improve bpb at this budget; the
+`no_refine` and `no_surprise` results are marginally better and materially
+faster. The complete HERM path therefore remains a research option, not the
+default cost-benefit winner.
+
+The epoch sweep also showed that HERM was not saturated at two epochs: the
+same seed moved from `6.319 bpb` at one epoch to `4.818 bpb` at four epochs.
+Comparing ablations before this budget would have measured convergence speed,
+not memory capacity.
 
 Commands:
 

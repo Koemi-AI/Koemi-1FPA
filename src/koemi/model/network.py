@@ -132,8 +132,14 @@ class KoemiModel(nn.Module):
         retention = torch.where(valid_mask.unsqueeze(-1), retention, torch.ones_like(retention))
         increment = torch.where(valid_mask.unsqueeze(-1), increment, torch.zeros_like(increment))
         working_states = affine_scan(retention, increment, current_state.working_state)
+        if self.settings.ablation == "affine":
+            return self.forward_affine_window(input_ids, current_state, working_states, cache_hits, cache_misses)
         prior_working_states = previous_states(working_states, current_state.working_state)
-        surprise = self.calculate_surprise(prior_working_states, input_ids, valid_mask)
+        surprise = (
+            torch.zeros_like(input_ids, dtype=working_states.dtype)
+            if self.settings.ablation == "no_surprise"
+            else self.calculate_surprise(prior_working_states, input_ids, valid_mask)
+        )
 
         local_keys, local_values, local_valid = self.local_memory.entries(working_states, valid_mask)
         local_value, novelty = self.local_memory.read_window(
@@ -164,32 +170,41 @@ class KoemiModel(nn.Module):
         )
 
         reconstruction_error = projection.value - fast_memory
-        refine_terms = self.mask_write_terms(
-            self.associative_memory.refine_write_terms(
-                projection,
-                reconstruction_error,
-                surprise,
-                novelty,
-            ),
-            valid_mask,
-        )
-        refine_basis_states = affine_scan(
-            refine_terms.decay.unsqueeze(-1),
-            refine_terms.basis_increment,
-            current_state.refine_basis,
-        )
-        refine_normalizer_states = affine_scan(
-            refine_terms.decay,
-            refine_terms.normalizer_increment,
-            current_state.refine_normalizer,
-        )
-        refine_memory, _ = self.associative_memory.read(
-            previous_states(refine_basis_states, current_state.refine_basis),
-            previous_states(refine_normalizer_states, current_state.refine_normalizer),
-            working_states,
-        )
+        if self.settings.ablation == "no_refine":
+            refine_basis_states = current_state.refine_basis.unsqueeze(1).expand(-1, length, -1, -1)
+            refine_normalizer_states = current_state.refine_normalizer.unsqueeze(1).expand(-1, length, -1)
+            refine_memory = torch.zeros_like(fast_memory)
+        else:
+            refine_terms = self.mask_write_terms(
+                self.associative_memory.refine_write_terms(
+                    projection,
+                    reconstruction_error,
+                    surprise,
+                    novelty,
+                ),
+                valid_mask,
+            )
+            refine_basis_states = affine_scan(
+                refine_terms.decay.unsqueeze(-1),
+                refine_terms.basis_increment,
+                current_state.refine_basis,
+            )
+            refine_normalizer_states = affine_scan(
+                refine_terms.decay,
+                refine_terms.normalizer_increment,
+                current_state.refine_normalizer,
+            )
+            refine_memory, _ = self.associative_memory.read(
+                previous_states(refine_basis_states, current_state.refine_basis),
+                previous_states(refine_normalizer_states, current_state.refine_normalizer),
+                working_states,
+            )
 
-        memory_value = self.refine_memory(working_states, fast_memory, refine_memory, local_value)
+        memory_value = (
+            fast_memory
+            if self.settings.ablation == "no_refine"
+            else self.refine_memory(working_states, fast_memory, refine_memory, local_value)
+        )
         fused_context = self.fuse(working_states, memory_value, local_value)
         previous_token_ids = self.previous_token_ids(input_ids, valid_mask, current_state.last_token_ids)
         positions = torch.arange(
@@ -237,6 +252,39 @@ class KoemiModel(nn.Module):
             expert_count=self.settings.expert_count,
         )
 
+    def forward_affine_window(
+        self,
+        input_ids: Tensor,
+        current_state: KoemiState,
+        working_states: Tensor,
+        cache_hits: int,
+        cache_misses: int,
+    ) -> KoemiOutput:
+        valid_mask = input_ids != PAD_TOKEN_ID
+        next_state = KoemiState(
+            working_state=working_states[:, -1],
+            memory_basis=current_state.memory_basis,
+            memory_normalizer=current_state.memory_normalizer,
+            refine_basis=current_state.refine_basis,
+            refine_normalizer=current_state.refine_normalizer,
+            local_keys=current_state.local_keys,
+            local_values=current_state.local_values,
+            local_valid=current_state.local_valid,
+            last_token_ids=self.last_valid_token_ids(input_ids, valid_mask, current_state.last_token_ids),
+            step_index=current_state.step_index + input_ids.shape[1],
+        )
+        return KoemiOutput(
+            logits=self.predict_tokens(working_states),
+            state=next_state,
+            surprise_values=torch.zeros_like(working_states[..., 0]),
+            expert_indices=torch.full_like(input_ids, -1),
+            valid_positions=valid_mask,
+            token_count=int(valid_mask.sum()),
+            cache_hits=cache_hits,
+            cache_misses=cache_misses,
+            expert_count=0,
+        )
+
     def forward_sequential(
         self,
         input_ids: Tensor,
@@ -257,16 +305,38 @@ class KoemiModel(nn.Module):
             input_state, position_hits, position_misses = self.embed_inputs(token_ids.unsqueeze(1), warm_cache)
             cache_hits += position_hits
             cache_misses += position_misses
-            surprise = self.calculate_surprise(
-                current_state.working_state.unsqueeze(1),
-                token_ids.unsqueeze(1),
-                valid_mask.unsqueeze(1),
-            ).squeeze(1)
+            surprise = (
+                torch.zeros_like(token_ids, dtype=input_state.dtype)
+                if self.settings.ablation == "no_surprise"
+                else self.calculate_surprise(
+                    current_state.working_state.unsqueeze(1),
+                    token_ids.unsqueeze(1),
+                    valid_mask.unsqueeze(1),
+                ).squeeze(1)
+            )
             working_state = torch.where(
                 valid_mask.unsqueeze(-1),
                 self.recurrent_state(current_state.working_state, input_state.squeeze(1)),
                 current_state.working_state,
             )
+            if self.settings.ablation == "affine":
+                logits_by_position.append(self.predict_tokens(working_state))
+                surprise_by_position.append(torch.zeros_like(working_state[:, 0]))
+                expert_indices_by_position.append(torch.full_like(token_ids, -1))
+                valid_by_position.append(valid_mask)
+                current_state = KoemiState(
+                    working_state=working_state,
+                    memory_basis=current_state.memory_basis,
+                    memory_normalizer=current_state.memory_normalizer,
+                    refine_basis=current_state.refine_basis,
+                    refine_normalizer=current_state.refine_normalizer,
+                    local_keys=current_state.local_keys,
+                    local_values=current_state.local_values,
+                    local_valid=current_state.local_valid,
+                    last_token_ids=torch.where(valid_mask, token_ids, current_state.last_token_ids),
+                    step_index=current_state.step_index + 1,
+                )
+                continue
             local_value, novelty = self.local_memory.read(
                 current_state.local_keys,
                 current_state.local_values,
@@ -279,12 +349,19 @@ class KoemiModel(nn.Module):
                 current_state.memory_normalizer,
                 working_state,
             )
-            refine_memory, _ = self.associative_memory.read(
-                current_state.refine_basis,
-                current_state.refine_normalizer,
-                working_state,
+            if self.settings.ablation == "no_refine":
+                refine_memory = torch.zeros_like(fast_memory)
+            else:
+                refine_memory, _ = self.associative_memory.read(
+                    current_state.refine_basis,
+                    current_state.refine_normalizer,
+                    working_state,
+                )
+            memory_value = (
+                fast_memory
+                if self.settings.ablation == "no_refine"
+                else self.refine_memory(working_state, fast_memory, refine_memory, local_value)
             )
-            memory_value = self.refine_memory(working_state, fast_memory, refine_memory, local_value)
             fused_context = self.fuse(working_state, memory_value, local_value)
             positions = torch.full_like(token_ids, current_state.step_index)
             final_context, expert_indices = self.experts(
@@ -305,17 +382,23 @@ class KoemiModel(nn.Module):
                 current_state.memory_normalizer,
                 fast_terms,
             )
-            refine_terms = self.associative_memory.refine_write_terms(
-                projection,
-                projection.value - fast_memory,
-                surprise,
-                novelty,
-            )
-            next_refine_basis, next_refine_normalizer = self.associative_memory.update(
-                current_state.refine_basis,
-                current_state.refine_normalizer,
-                refine_terms,
-            )
+            if self.settings.ablation == "no_refine":
+                next_refine_basis, next_refine_normalizer = (
+                    current_state.refine_basis,
+                    current_state.refine_normalizer,
+                )
+            else:
+                refine_terms = self.associative_memory.refine_write_terms(
+                    projection,
+                    projection.value - fast_memory,
+                    surprise,
+                    novelty,
+                )
+                next_refine_basis, next_refine_normalizer = self.associative_memory.update(
+                    current_state.refine_basis,
+                    current_state.refine_normalizer,
+                    refine_terms,
+                )
             written_key, written_value, written_valid = self.local_memory.entries(working_state, valid_mask)
             next_local_keys, next_local_values, next_local_valid = self.local_memory.append(
                 current_state.local_keys,
