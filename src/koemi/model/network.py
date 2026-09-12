@@ -8,7 +8,7 @@ from torch import Tensor, nn
 from koemi.configuration.settings import ModelSettings, PAD_TOKEN_ID
 from koemi.model.layers import RootMeanSquareNorm
 from koemi.model.memory import AssociativeMemory, BoundedRecurrentState, LocalKeyValueMemory
-from koemi.model.router import RiskRouter, RouteSelection, SPECIALIST_NAMES
+from koemi.model.router import SPECIALIST_COUNT, RiskRouter, RouteSelection, RoutingMode
 from koemi.model.specialists import SpecialistPath
 from koemi.model.state import KoemiState
 
@@ -16,11 +16,29 @@ from koemi.model.state import KoemiState
 @dataclass(frozen=True)
 class KoemiOutput:
     logits: Tensor
+    fast_logits: Tensor
     state: KoemiState
+    risk_logits: Tensor
     risk_values: Tensor
+    route_weights: Tensor
+    specialist_selection: Tensor
+    executed_deep: Tensor
+    valid_positions: Tensor
+    routing_mode: RoutingMode
     token_count: int
     deep_token_count: int
     specialist_activations: int
+
+    @property
+    def deep_token_fraction(self) -> float:
+        if self.token_count == 0:
+            return 0.0
+        return self.deep_token_count / self.token_count
+
+    @property
+    def specialist_activation_counts(self) -> tuple[int, ...]:
+        counts = self.specialist_selection.sum(dim=0).sum(dim=0)
+        return tuple(int(count) for count in counts)
 
 
 class KoemiModel(nn.Module):
@@ -41,11 +59,16 @@ class KoemiModel(nn.Module):
             settings.risk_threshold,
             settings.exploration_interval,
         )
-        self.specialists = nn.ModuleList(SpecialistPath(embedding_size) for _ in SPECIALIST_NAMES)
+        self.specialists = nn.ModuleList(SpecialistPath(embedding_size) for _ in range(SPECIALIST_COUNT))
         self.output_normalizer = RootMeanSquareNorm(embedding_size)
         self.token_predictor = nn.Linear(embedding_size, settings.vocabulary_size, bias=False)
 
-    def forward(self, input_ids: Tensor, state: KoemiState | None = None) -> KoemiOutput:
+    def forward(
+        self,
+        input_ids: Tensor,
+        state: KoemiState | None = None,
+        routing_mode: RoutingMode = RoutingMode.HARD,
+    ) -> KoemiOutput:
         self.validate_input_ids(input_ids)
         batch_size, sequence_length = input_ids.shape
         current_state = state or KoemiState.create(
@@ -54,8 +77,14 @@ class KoemiModel(nn.Module):
             self.settings.memory_features,
             input_ids.device,
         )
-        output_logits: list[Tensor] = []
+        routed_logits: list[Tensor] = []
+        preview_logits: list[Tensor] = []
+        risk_logits: list[Tensor] = []
         risk_values: list[Tensor] = []
+        route_weights: list[Tensor] = []
+        specialist_selection: list[Tensor] = []
+        executed_deep: list[Tensor] = []
+        valid_positions: list[Tensor] = []
         token_count = 0
         deep_token_count = 0
         specialist_activations = 0
@@ -88,12 +117,13 @@ class KoemiModel(nn.Module):
                 novelty,
                 current_state.step_index,
             )
-            final_context, selected_count = self.apply_deep_paths(
+            execute_deep = self.select_executed_rows(route_selection, valid_mask, routing_mode)
+            final_context, selection_mask = self.apply_deep_paths(
                 fast_context,
                 memory_value,
                 local_value,
                 route_selection,
-                valid_mask,
+                execute_deep,
             )
             final_logits = self.token_predictor(final_context)
             next_memory_basis, next_memory_normalizer = self.associative_memory.write(
@@ -103,8 +133,6 @@ class KoemiModel(nn.Module):
                 final_context,
                 fast_context,
             )
-            valid_memory_mask = valid_mask.view(batch_size, 1, 1)
-            valid_normalizer_mask = valid_mask.view(batch_size, 1)
             next_local_keys, next_local_values = self.local_memory.append(
                 current_state.local_keys,
                 current_state.local_values,
@@ -114,25 +142,43 @@ class KoemiModel(nn.Module):
             )
             current_state = KoemiState(
                 working_state=working_state,
-                memory_basis=torch.where(valid_memory_mask, next_memory_basis, current_state.memory_basis),
-                memory_normalizer=torch.where(valid_normalizer_mask, next_memory_normalizer, current_state.memory_normalizer),
+                memory_basis=torch.where(valid_mask.view(batch_size, 1, 1), next_memory_basis, current_state.memory_basis),
+                memory_normalizer=torch.where(valid_mask.view(batch_size, 1), next_memory_normalizer, current_state.memory_normalizer),
                 local_keys=next_local_keys,
                 local_values=next_local_values,
                 step_index=current_state.step_index + 1,
             )
-            output_logits.append(final_logits)
+            routed_logits.append(final_logits)
+            preview_logits.append(fast_logits)
+            risk_logits.append(route_selection.risk_logit)
             risk_values.append(route_selection.risk)
+            route_weights.append(route_selection.route_weights)
+            specialist_selection.append(selection_mask)
+            executed_deep.append(execute_deep)
+            valid_positions.append(valid_mask)
             token_count += int(valid_mask.sum().item())
             deep_token_count += int((route_selection.use_deep_path & valid_mask).sum().item())
-            specialist_activations += selected_count
+            specialist_activations += int(selection_mask.sum().item())
         return KoemiOutput(
-            logits=torch.stack(output_logits, dim=1),
+            logits=torch.stack(routed_logits, dim=1),
+            fast_logits=torch.stack(preview_logits, dim=1),
             state=current_state,
+            risk_logits=torch.stack(risk_logits, dim=1),
             risk_values=torch.stack(risk_values, dim=1),
+            route_weights=torch.stack(route_weights, dim=1),
+            specialist_selection=torch.stack(specialist_selection, dim=1),
+            executed_deep=torch.stack(executed_deep, dim=1),
+            valid_positions=torch.stack(valid_positions, dim=1),
+            routing_mode=routing_mode,
             token_count=token_count,
             deep_token_count=deep_token_count,
             specialist_activations=specialist_activations,
         )
+
+    def select_executed_rows(self, route_selection: RouteSelection, valid_mask: Tensor, routing_mode: RoutingMode) -> Tensor:
+        if routing_mode is RoutingMode.CALIBRATION:
+            return valid_mask.to(dtype=torch.float32)
+        return (route_selection.use_deep_path & valid_mask).to(dtype=torch.float32)
 
     def validate_input_ids(self, input_ids: Tensor) -> None:
         if input_ids.ndim != 2:
@@ -159,31 +205,24 @@ class KoemiModel(nn.Module):
         memory_value: Tensor,
         local_value: Tensor,
         route_selection: RouteSelection,
-        valid_mask: Tensor,
-    ) -> tuple[Tensor, int]:
-        output_contexts: list[Tensor] = []
-        specialist_activations = 0
-        for batch_index in range(fast_context.shape[0]):
-            base_context = fast_context[batch_index : batch_index + 1]
-            if not bool(valid_mask[batch_index]) or not bool(route_selection.use_deep_path[batch_index]):
-                output_contexts.append(base_context.squeeze(0))
+        execute_deep: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        mixture_weights = self.router.mixture_weights(route_selection, execute_deep)
+        mixed_output = torch.zeros_like(fast_context)
+        for specialist_index in range(SPECIALIST_COUNT):
+            specialist_weights = mixture_weights[:, specialist_index]
+            row_indices = torch.nonzero(specialist_weights, as_tuple=False).squeeze(-1)
+            if row_indices.numel() == 0:
                 continue
-            active_indices = route_selection.active_indices[batch_index]
-            selected_scores = route_selection.route_scores[batch_index].index_select(0, active_indices)
-            selected_weights = torch.softmax(selected_scores, dim=0)
-            specialist_outputs = torch.stack(
-                [
-                    self.specialists[int(specialist_index)](
-                        base_context,
-                        memory_value[batch_index : batch_index + 1],
-                        local_value[batch_index : batch_index + 1],
-                        self.settings.deep_steps,
-                    ).squeeze(0)
-                    for specialist_index in active_indices
-                ],
-                dim=0,
+            specialist_output = self.specialists[specialist_index](
+                fast_context.index_select(0, row_indices),
+                memory_value.index_select(0, row_indices),
+                local_value.index_select(0, row_indices),
+                self.settings.deep_steps,
             )
-            mixed_output = (selected_weights.unsqueeze(-1) * specialist_outputs).sum(dim=0)
-            output_contexts.append(self.output_normalizer(base_context.squeeze(0) + mixed_output))
-            specialist_activations += len(active_indices)
-        return torch.stack(output_contexts, dim=0), specialist_activations
+            weighted_output = specialist_weights.index_select(0, row_indices).unsqueeze(-1) * specialist_output
+            mixed_output = mixed_output.index_add(0, row_indices, weighted_output)
+        deep_context = self.output_normalizer(fast_context + mixed_output)
+        deep_rows = execute_deep.unsqueeze(-1) > 0.0
+        final_context = torch.where(deep_rows, deep_context, fast_context)
+        return final_context, (mixture_weights > 0.0).to(dtype=torch.float32)

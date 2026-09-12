@@ -5,7 +5,7 @@ import json
 import sys
 from typing import Sequence
 
-from koemi.configuration.settings import ModelSettings, TrainingSettings
+from koemi.configuration.settings import ModelSettings, RouterSettings, TrainingSettings
 from koemi.data.adapters import SUPPORTED_DATASET_FORMATS
 from koemi.data.readers import DatasetLoadReport, load_dataset_records
 from koemi.data.tokenizer import ByteTokenizer
@@ -53,6 +53,11 @@ def create_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--learning-rate", type=float, default=0.001)
     train_parser.add_argument("--gradient-clip-norm", type=float, default=1.0)
     train_parser.add_argument("--device", default="cpu")
+    train_parser.add_argument("--routing-mode", choices=("calibration", "hard"), default="calibration")
+    train_parser.add_argument("--hard-margin", type=float, default=0.05)
+    train_parser.add_argument("--router-loss-weight", type=float, default=1.0)
+    train_parser.add_argument("--compute-penalty-weight", type=float, default=0.05)
+    train_parser.add_argument("--balance-loss-weight", type=float, default=0.01)
     add_model_arguments(train_parser)
 
     generate_parser = subparsers.add_parser("generate", help="Generate text from a Koemi checkpoint")
@@ -100,18 +105,39 @@ def train_model(arguments: argparse.Namespace, logger) -> int:
         learning_rate=arguments.learning_rate,
         gradient_clip_norm=arguments.gradient_clip_norm,
         device=arguments.device,
+        routing_mode=arguments.routing_mode,
+    )
+    router_settings = RouterSettings(
+        hard_margin=arguments.hard_margin,
+        router_loss_weight=arguments.router_loss_weight,
+        compute_penalty_weight=arguments.compute_penalty_weight,
+        balance_loss_weight=arguments.balance_loss_weight,
+        decision_threshold=model_settings.risk_threshold,
     )
     dataset = CausalByteDataset(report.records, training_settings.sequence_length)
     loader = create_training_loader(dataset, training_settings.batch_size)
     model = KoemiModel(model_settings)
-    result = Trainer(logger).train(model, loader, training_settings)
+    result = Trainer(logger).train(model, loader, training_settings, router_settings)
     checkpoint_path = CheckpointStore().save(arguments.checkpoint, model, overwrite=arguments.overwrite)
     logger.info(
-        "training_completed checkpoint=%s mean_loss=%.6f supervised_tokens=%s deep_tokens=%s elapsed_seconds=%.3f",
+        "training_completed checkpoint=%s mean_loss=%.6f task_loss=%.6f deep_loss=%.6f fast_loss=%.6f "
+        "router_loss=%.6f router_accuracy=%.4f "
+        "hard_fraction=%.4f mean_risk=%.4f supervised_tokens=%s tokens=%s deep_tokens=%s deep_fraction=%.4f "
+        "specialist_activations=%s elapsed_seconds=%.3f",
         checkpoint_path,
         result.mean_loss,
+        result.mean_task_loss,
+        result.mean_deep_loss,
+        result.mean_fast_loss,
+        result.mean_router_loss,
+        result.router_accuracy,
+        result.hard_token_fraction,
+        result.mean_risk,
         result.supervised_token_count,
+        result.token_count,
         result.deep_token_count,
+        result.deep_token_fraction,
+        result.specialist_activation_counts,
         result.elapsed_seconds,
     )
     return 0
