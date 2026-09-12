@@ -4,6 +4,7 @@ import math
 import unittest
 
 from benchmarks.run_benchmark import create_parser, evaluation_error, run_single_model
+from benchmarks.run_wikitext import group_wikitext_documents
 from koemi.observability.report import RunReport
 
 
@@ -39,6 +40,18 @@ def run_model(model_name: str) -> dict:
 
 
 class BenchmarkMetricTests(unittest.TestCase):
+    def test_wikitext_groups_rows_by_article_heading(self) -> None:
+        documents = group_wikitext_documents(
+            [
+                " = Article one = ",
+                "first paragraph",
+                "second paragraph",
+                " = Article two = ",
+                "another paragraph",
+            ]
+        )
+        self.assertEqual(("= Article one = \nfirst paragraph\nsecond paragraph", "= Article two = \nanother paragraph"), documents)
+
     def test_benchmark_accepts_compile_flag(self) -> None:
         arguments = create_parser().parse_args(["--compile"])
         self.assertTrue(arguments.compile)
