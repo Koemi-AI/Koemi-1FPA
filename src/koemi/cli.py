@@ -15,10 +15,12 @@ from koemi.data.tokenizer import ByteTokenizer
 from koemi.model.cache import DiskMappingCache, WarmTokenCache
 from koemi.model.network import KoemiModel
 from koemi.observability.logging import configure_logging
+from koemi.observability.report import build_run_report, render_json
+from koemi.observability.resources import measure_peak_memory
 from koemi.training.checkpoints import CheckpointStore
 from koemi.training.dataset import CausalByteDataset, create_training_loader
 from koemi.training.generation import generate_text
-from koemi.training.trainer import Trainer
+from koemi.training.trainer import Trainer, TrainingResult
 
 
 def main(arguments: Sequence[str] | None = None) -> int:
@@ -69,6 +71,7 @@ def create_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--num-workers", type=int, default=0)
     train_parser.add_argument("--prefetch-factor", type=int, default=2)
     train_parser.add_argument("--no-pin-memory", action="store_true")
+    train_parser.add_argument("--report", default=None, help="Write the standard run report JSON to this path")
     add_model_arguments(train_parser)
 
     generate_parser = subparsers.add_parser("generate", help="Generate text from a Koemi-2OBOV checkpoint")
@@ -159,6 +162,8 @@ def train_model(arguments: argparse.Namespace, logger) -> int:
             pin_memory=effective_pin_memory,
             prefetch_factor=training_settings.prefetch_factor,
         )
+    if arguments.report and validation_loader is None:
+        raise ValueError("--report requires a validation split, so --validation-fraction must be above zero")
     model = KoemiModel(model_settings)
     result = Trainer(logger).train(model, loader, training_settings, validation_loader)
     checkpoint_path = CheckpointStore().save(arguments.checkpoint, model, overwrite=arguments.overwrite)
@@ -183,7 +188,36 @@ def train_model(arguments: argparse.Namespace, logger) -> int:
         result.expert_activation_counts,
         result.elapsed_seconds,
     )
+    if arguments.report:
+        write_run_report(arguments, model, result)
     return 0
+
+
+def write_run_report(arguments: argparse.Namespace, model: KoemiModel, result: TrainingResult) -> None:
+    peak_memory_bytes, peak_memory_source = measure_peak_memory(result.device)
+    report = build_run_report(
+        model="koemi",
+        parameters=sum(parameter.numel() for parameter in model.parameters()),
+        parameters_receiving_gradient=result.parameters_receiving_gradient,
+        train_loss_nats=result.mean_task_loss,
+        validation_loss_nats=result.validation_task_loss,
+        validation_tokens=result.validation_supervised_token_count,
+        train_tokens=result.supervised_token_count,
+        elapsed_seconds=result.elapsed_seconds,
+        validation_seconds_inside_elapsed=result.validation_seconds_inside_elapsed,
+        seed=arguments.seed,
+        epochs=arguments.epochs,
+        optimizer_steps=result.optimizer_steps,
+        batch_size=arguments.batch_size,
+        sequence_length=arguments.sequence_length,
+        precision=result.precision,
+        device=result.device,
+        ablation=arguments.ablation,
+        learning_rate_by_epoch=result.learning_rate_by_epoch,
+        peak_memory_bytes=peak_memory_bytes,
+        peak_memory_source=peak_memory_source,
+    )
+    Path(arguments.report).write_text(render_json(report.to_dict()), encoding="utf-8")
 
 
 def generate_completion(arguments: argparse.Namespace, logger) -> int:

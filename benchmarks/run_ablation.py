@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import argparse
 import json
-import statistics
 import subprocess
 import sys
 from pathlib import Path
+
+REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
+
+from koemi.observability.report import RunReport, aggregate_run_reports, render_json
 
 
 ABLATIONS = ("affine", "no_refine", "no_surprise", "herm")
@@ -56,24 +60,15 @@ def run_one(
     completed = subprocess.run(command, capture_output=True, text=True, check=False)
     if completed.returncode != 0:
         raise RuntimeError(f"ablation {ablation} seed {seed} failed: {completed.stderr.strip()}")
-    report = json.loads(completed.stdout)
-    report["seed"] = seed
-    return report
+    return json.loads(completed.stdout)
 
 
-def summarize(reports: list[dict]) -> dict:
-    bpb_values = [report["bits_per_byte"] for report in reports]
+def summarize(payloads: list[dict]) -> dict:
+    reports = [RunReport.from_dict(payload["report"]) for payload in payloads]
     return {
-        "seeds": [report["seed"] for report in reports],
-        "evaluation_supervised_tokens": reports[0]["evaluation_supervised_tokens"],
-        "bpb_mean": statistics.mean(bpb_values),
-        "bpb_standard_deviation": statistics.stdev(bpb_values) if len(bpb_values) > 1 else float("nan"),
-        "bpb_standard_errors": [report["bits_per_byte_standard_error"] for report in reports],
-        "evaluation_loss_mean_nats": statistics.mean(report["evaluation_loss_nats"] for report in reports),
-        "train_tokens_per_second_mean": statistics.mean(report["train_tokens_per_second"] for report in reports),
-        "evaluation_tokens_per_second_mean": statistics.mean(
-            report["evaluation_tokens_per_second"] for report in reports
-        ),
+        "report": aggregate_run_reports(reports).to_dict(),
+        "reports_by_seed": [report.to_dict() for report in reports],
+        "diagnostics_by_seed": [payload["diagnostics"] for payload in payloads],
     }
 
 
@@ -100,7 +95,7 @@ def main(argument_values: list[str] | None = None) -> int:
     benchmark_path = Path(__file__).with_name("run_benchmark.py")
     result = {}
     for ablation in ABLATIONS:
-        reports = [
+        payloads = [
             run_one(
                 benchmark_path,
                 arguments.task,
@@ -117,8 +112,8 @@ def main(argument_values: list[str] | None = None) -> int:
             )
             for seed in arguments.seeds
         ]
-        result[ablation] = summarize(reports)
-    rendered = json.dumps(result, indent=2, sort_keys=True)
+        result[ablation] = summarize(payloads)
+    rendered = render_json(result)
     if arguments.report:
         Path(arguments.report).write_text(rendered, encoding="utf-8")
     print(rendered)

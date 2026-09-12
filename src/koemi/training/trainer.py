@@ -13,8 +13,21 @@ from torch.utils.data import DataLoader
 from koemi.configuration.settings import TrainingSettings
 from koemi.model.execution import ExecutionMode
 from koemi.model.network import KoemiModel, KoemiOutput
+from koemi.observability.report import EpochLearningRate
 from koemi.training.dataset import IGNORE_TARGET_ID
 from koemi.training.objective import TrainingObjective, calculate_training_objective
+
+
+@dataclass(frozen=True)
+class RunTelemetry:
+    elapsed_seconds: float
+    validation_seconds_inside_elapsed: float
+    optimizer_steps: int
+    final_learning_rate: float
+    precision: str
+    learning_rate_by_epoch: tuple[EpochLearningRate, ...]
+    parameters_receiving_gradient: int
+    device: str
 
 
 @dataclass(frozen=True)
@@ -33,6 +46,12 @@ class TrainingResult:
     tokens_per_second: float
     final_learning_rate: float
     precision: str
+    validation_task_loss: float | None
+    validation_supervised_token_count: int
+    validation_seconds_inside_elapsed: float
+    learning_rate_by_epoch: tuple[EpochLearningRate, ...]
+    parameters_receiving_gradient: int
+    device: str
 
 
 class Trainer:
@@ -61,11 +80,15 @@ class Trainer:
         scaler = torch.amp.GradScaler(device.type, enabled=device.type == "cuda" and precision == "fp16")
         accumulator = MetricAccumulator()
         optimizer_steps = 0
+        validation_seconds_inside_elapsed = 0.0
+        parameters_receiving_gradient = 0
+        learning_rate_by_epoch: list[EpochLearningRate] = []
         start_time = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
         for epoch_index in range(1, settings.epochs + 1):
             epoch_metrics = MetricAccumulator()
             accumulated_batches = 0
+            learning_rate_at_epoch_start = optimizer.param_groups[0]["lr"]
             for batch_index, batch in enumerate(loader, start=1):
                 input_ids, target_ids, thinking_mask = self.move_batch(batch, device, settings.pin_memory)
                 supervised_count = int((target_ids != IGNORE_TARGET_ID).sum().item())
@@ -82,6 +105,8 @@ class Trainer:
                     )
                     scaled_loss = objective.total_loss / settings.gradient_accumulation_steps
                 scaler.scale(scaled_loss).backward()
+                if parameters_receiving_gradient == 0:
+                    parameters_receiving_gradient = count_parameters_with_gradient(model)
                 accumulated_batches += 1
                 if accumulated_batches == settings.gradient_accumulation_steps:
                     self.optimizer_step(model, optimizer, scheduler, scaler, settings, accumulated_batches)
@@ -93,11 +118,20 @@ class Trainer:
                 optimizer_steps += 1
             if epoch_metrics.supervised_token_count == 0:
                 raise ValueError("training loader produced no supervised tokens")
-            validation = (
-                self.evaluate(model, validation_loader, settings, device, execution_mode, autocast_dtype)
-                if validation_loader is not None
-                else None
+            learning_rate_by_epoch.append(
+                EpochLearningRate(
+                    epoch=epoch_index,
+                    learning_rate_start=learning_rate_at_epoch_start,
+                    learning_rate_end=optimizer.param_groups[0]["lr"],
+                )
             )
+            validation = None
+            if validation_loader is not None:
+                validation_start_time = time.perf_counter()
+                validation = self.evaluate(
+                    model, validation_loader, settings, device, execution_mode, autocast_dtype
+                )
+                validation_seconds_inside_elapsed += time.perf_counter() - validation_start_time
             self.logger.info(
                 "epoch_completed epoch=%s loss=%.6f task_loss=%.6f thinking_loss=%.6f surprise=%.4f "
                 "validation_loss=%s validation_perplexity=%s learning_rate=%.8f optimizer_steps=%s "
@@ -123,13 +157,17 @@ class Trainer:
             if validation_loader is not None
             else None
         )
-        return accumulator.to_result(
-            elapsed_seconds,
-            final_validation,
-            optimizer_steps,
-            optimizer.param_groups[0]["lr"],
-            precision,
+        telemetry = RunTelemetry(
+            elapsed_seconds=elapsed_seconds,
+            validation_seconds_inside_elapsed=validation_seconds_inside_elapsed,
+            optimizer_steps=optimizer_steps,
+            final_learning_rate=optimizer.param_groups[0]["lr"],
+            precision=precision,
+            learning_rate_by_epoch=tuple(learning_rate_by_epoch),
+            parameters_receiving_gradient=parameters_receiving_gradient,
+            device=str(device),
         )
+        return accumulator.to_result(telemetry, final_validation)
 
     def evaluate(
         self,
@@ -229,6 +267,10 @@ class Trainer:
         optimizer.zero_grad(set_to_none=True)
 
 
+def count_parameters_with_gradient(model: nn.Module) -> int:
+    return sum(parameter.numel() for parameter in model.parameters() if parameter.grad is not None)
+
+
 class MetricAccumulator:
     def __init__(self) -> None:
         self.weighted_loss = 0.0
@@ -282,14 +324,7 @@ class MetricAccumulator:
     def mean_surprise(self) -> float:
         return self.surprise_total / self.token_count if self.token_count else 0.0
 
-    def to_result(
-        self,
-        elapsed_seconds: float,
-        validation: MetricAccumulator | None,
-        optimizer_steps: int,
-        final_learning_rate: float,
-        precision: str,
-    ) -> TrainingResult:
+    def to_result(self, telemetry: RunTelemetry, validation: MetricAccumulator | None) -> TrainingResult:
         validation_loss = validation.mean_loss if validation else None
         return TrainingResult(
             self.mean_loss,
@@ -299,11 +334,17 @@ class MetricAccumulator:
             self.supervised_token_count,
             self.token_count,
             tuple(self.expert_activation_counts),
-            elapsed_seconds,
+            telemetry.elapsed_seconds,
             validation_loss,
             math.exp(min(validation_loss, 80.0)) if validation_loss is not None else None,
-            optimizer_steps,
-            self.supervised_token_count / elapsed_seconds,
-            final_learning_rate,
-            precision,
+            telemetry.optimizer_steps,
+            self.supervised_token_count / telemetry.elapsed_seconds,
+            telemetry.final_learning_rate,
+            telemetry.precision,
+            validation.mean_task_loss if validation else None,
+            validation.supervised_token_count if validation else 0,
+            telemetry.validation_seconds_inside_elapsed,
+            telemetry.learning_rate_by_epoch,
+            telemetry.parameters_receiving_gradient,
+            telemetry.device,
         )

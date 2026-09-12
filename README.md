@@ -179,8 +179,15 @@ more finely than byte-only dispatch, but it is not learned semantic routing.
 .venv/bin/python benchmarks/run_ablation.py --task recall --seeds 17 29 41 --train-records 1024 --evaluation-records 1024 --epochs 4 --report artifacts/ablation-recall.json
 ```
 
-The harness compares OBOV with parameter-matched GRU and LSTM baselines. The
-old Koemi-1FPA measurements remain archived in [`docs/BENCHMARK.md`](docs/BENCHMARK.md)
+The harness compares OBOV with parameter-matched GRU and LSTM baselines. Every
+run emits one JSON schema, identical for `koemi`, `gru` and `lstm`, documented
+field by field in [`docs/BENCHMARK.md`](docs/BENCHMARK.md). Throughput appears
+twice, once including and once excluding the validation time contained in
+`elapsed_seconds`, because the training path and the benchmark path do not time
+the same window. `koemi train --report PATH` writes the same schema and needs
+`--validation-fraction` above zero.
+
+The old Koemi-1FPA measurements remain archived in [`docs/BENCHMARK.md`](docs/BENCHMARK.md)
 and are not OBOV results. The ablation runner requires at least three seeds and
 reports mean and standard deviation. The affine control is the minimum quality
 baseline; a small-budget single-seed run is not evidence of memory capacity.
