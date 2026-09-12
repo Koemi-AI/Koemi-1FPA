@@ -16,7 +16,10 @@ class DeterministicExpertMixture(nn.Module):
         super().__init__()
         self.expert_count = expert_count
         self.experts = nn.ModuleList(GatedFeedForward(embedding_size) for _ in range(expert_count))
-        self.output_normalizer = RootMeanSquareNorm(embedding_size)
+        if expert_count > 0:
+            self.output_normalizer = RootMeanSquareNorm(embedding_size)
+        else:
+            self.register_module("output_normalizer", None)
 
     def forward(
         self,
