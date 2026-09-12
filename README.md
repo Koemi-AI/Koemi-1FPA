@@ -1,8 +1,19 @@
-# Koemi-2OBOV
+# Koemi-2OBOV Variata
 
 Koemi-2OBOV is a PyTorch training base for byte-level causal models built on
 HERM (Hierarchical Error-Refined Memory): bounded recurrent state, fast and
 slow associative memory, local exact recall and optional deterministic experts.
+
+![Koemi logo](assets/KoemiLogo.png)
+
+## Release status
+
+This is a Variata release for experimental training and benchmark work. The
+architecture is usable for small-model tests, but its memory and refine path
+remain subject to change. Results in this branch are not the final HERM
+architecture. The next consolidation target is Koemi-3HERM, where HERM will be
+reworked only after multi-seed ablations, stronger recall tasks and matched
+baseline comparisons justify the design.
 
 This repository contains architecture and training code. It does not ship a
 trained model and does not claim Transformer-level quality.

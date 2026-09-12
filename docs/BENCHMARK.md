@@ -1,5 +1,9 @@
 # Koemi benchmark ledger
 
+The current tree is published as Koemi-2OBOV Variata, an experimental release.
+It is not the final HERM consolidation; that is reserved for Koemi-3HERM after
+the open recall, ablation and baseline gates close.
+
 This file separates historical Koemi-1FPA measurements from Koemi-2OBOV
 measurements. The old numbers must not be quoted as OBOV results.
 
