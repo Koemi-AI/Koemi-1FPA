@@ -47,7 +47,10 @@ class BenchmarkReport:
     train_tokens_per_second: float
     train_loss_nats: float
     evaluation_loss_nats: float
+    evaluation_supervised_tokens: int
+    evaluation_loss_standard_error_nats: float
     bits_per_byte: float
+    bits_per_byte_standard_error: float
     evaluation_tokens_per_second: float
     peak_resident_bytes: int | None
     expert_activation_counts: tuple[int, ...] | None
@@ -168,10 +171,18 @@ def koemi_state_bytes(settings: ModelSettings) -> int:
     return state_scalars * 4 + local_bytes + valid_bytes + last_token_bytes
 
 
-def evaluate_baseline(model: RecurrentBaseline, loader: DataLoader) -> tuple[float, float, int]:
+def evaluation_error(values: list[float]) -> float:
+    if len(values) < 2:
+        return float("nan")
+    values_tensor = torch.tensor(values, dtype=torch.float64)
+    return float(values_tensor.std(unbiased=True) / len(values) ** 0.5)
+
+
+def evaluate_baseline(model: RecurrentBaseline, loader: DataLoader) -> tuple[float, float, int, float]:
     model.eval()
     total_loss = 0.0
     total_tokens = 0
+    token_losses: list[float] = []
     start_time = time.perf_counter()
     with torch.no_grad():
         for batch in loader:
@@ -183,15 +194,17 @@ def evaluate_baseline(model: RecurrentBaseline, loader: DataLoader) -> tuple[flo
             logits = model(batch["input_ids"])
             token_loss = token_cross_entropy(logits, target_ids)
             total_loss += float((token_loss * supervised_mask).sum())
+            token_losses.extend(token_loss.masked_select(supervised_mask).tolist())
             total_tokens += supervised_count
     elapsed_seconds = time.perf_counter() - start_time
-    return total_loss / total_tokens, elapsed_seconds, total_tokens
+    return total_loss / total_tokens, elapsed_seconds, total_tokens, evaluation_error(token_losses)
 
 
-def evaluate_koemi(model: KoemiModel, loader: DataLoader) -> tuple[float, float, int, tuple[int, ...]]:
+def evaluate_koemi(model: KoemiModel, loader: DataLoader) -> tuple[float, float, int, float, tuple[int, ...]]:
     model.eval()
     total_loss = 0.0
     total_tokens = 0
+    token_losses: list[float] = []
     activation_counts: list[int] = []
     start_time = time.perf_counter()
     with torch.no_grad():
@@ -202,7 +215,9 @@ def evaluate_koemi(model: KoemiModel, loader: DataLoader) -> tuple[float, float,
             if supervised_count == 0:
                 continue
             output = model(batch["input_ids"])
-            total_loss += float((token_cross_entropy(output.logits, target_ids) * supervised_mask).sum())
+            token_loss = token_cross_entropy(output.logits, target_ids)
+            total_loss += float((token_loss * supervised_mask).sum())
+            token_losses.extend(token_loss.masked_select(supervised_mask).tolist())
             total_tokens += supervised_count
             counts = output.expert_activation_counts
             if len(activation_counts) < len(counts):
@@ -210,7 +225,7 @@ def evaluate_koemi(model: KoemiModel, loader: DataLoader) -> tuple[float, float,
             for index, count in enumerate(counts):
                 activation_counts[index] += count
     elapsed_seconds = time.perf_counter() - start_time
-    return total_loss / total_tokens, elapsed_seconds, total_tokens, tuple(activation_counts)
+    return total_loss / total_tokens, elapsed_seconds, total_tokens, evaluation_error(token_losses), tuple(activation_counts)
 
 
 def train_baseline(model: RecurrentBaseline, loader: DataLoader, arguments: argparse.Namespace) -> tuple[float, float, int]:
@@ -273,7 +288,7 @@ def run_single_model(arguments: argparse.Namespace) -> BenchmarkReport:
         logger = logging.getLogger("koemi-benchmark")
         logger.addHandler(logging.NullHandler())
         result = Trainer(logger).train(model, train_loader, training_settings)
-        loss, evaluation_seconds, evaluation_tokens, activations = evaluate_koemi(model, evaluation_loader)
+        loss, evaluation_seconds, evaluation_tokens, loss_standard_error, activations = evaluate_koemi(model, evaluation_loader)
         return BenchmarkReport(
             model_name="koemi",
             task_name=arguments.task,
@@ -284,7 +299,10 @@ def run_single_model(arguments: argparse.Namespace) -> BenchmarkReport:
             train_tokens_per_second=result.supervised_token_count / result.elapsed_seconds,
             train_loss_nats=result.mean_loss,
             evaluation_loss_nats=loss,
+            evaluation_supervised_tokens=evaluation_tokens,
+            evaluation_loss_standard_error_nats=loss_standard_error,
             bits_per_byte=loss / NATS_PER_BIT,
+            bits_per_byte_standard_error=loss_standard_error / NATS_PER_BIT,
             evaluation_tokens_per_second=evaluation_tokens / evaluation_seconds,
             peak_resident_bytes=peak_resident_bytes(),
             expert_activation_counts=activations,
@@ -294,7 +312,7 @@ def run_single_model(arguments: argparse.Namespace) -> BenchmarkReport:
     baseline = RecurrentBaseline(arguments.model, arguments.embedding_size, hidden_size)
     parameter_count, parameter_bytes = count_parameter_bytes(baseline)
     train_loss, train_seconds, train_tokens = train_baseline(baseline, train_loader, arguments)
-    loss, evaluation_seconds, evaluation_tokens = evaluate_baseline(baseline, evaluation_loader)
+    loss, evaluation_seconds, evaluation_tokens, loss_standard_error = evaluate_baseline(baseline, evaluation_loader)
     return BenchmarkReport(
         model_name=arguments.model,
         task_name=arguments.task,
@@ -305,7 +323,10 @@ def run_single_model(arguments: argparse.Namespace) -> BenchmarkReport:
         train_tokens_per_second=train_tokens / train_seconds,
         train_loss_nats=train_loss,
         evaluation_loss_nats=loss,
+        evaluation_supervised_tokens=evaluation_tokens,
+        evaluation_loss_standard_error_nats=loss_standard_error,
         bits_per_byte=loss / NATS_PER_BIT,
+        bits_per_byte_standard_error=loss_standard_error / NATS_PER_BIT,
         evaluation_tokens_per_second=evaluation_tokens / evaluation_seconds,
         peak_resident_bytes=peak_resident_bytes(),
         expert_activation_counts=None,

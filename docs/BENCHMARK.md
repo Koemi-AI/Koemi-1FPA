@@ -41,6 +41,27 @@ The immediately preceding same-budget Koemi snapshot measured 7.722 bits/byte,
 +32.8% recurrent state. One timing run is noisy; only the quality/state deltas
 are useful as an early regression signal.
 
+### Recall sample-size check
+
+The same HERM configuration was evaluated with 1,024 records (3,072
+supervised bytes), producing `5.429 nats = 7.833 bpb +/- 0.015 bpb` standard
+error. The earlier 48-token evaluation produced `7.552 bpb`; it was too small
+to support a quality conclusion. Reports now include processed-token count,
+supervised-token count and standard error for every model.
+
+The throughput denominator is also explicit: the small benchmark had 1,026
+supervised training bytes for `bytes` but only 48 for `recall`. The latter is
+dominated by fixed batch/forward overhead, so those task throughputs are not
+directly comparable.
+
+### Controlled overfit check
+
+With 20 recall records, 500 FP32 AdamW steps, zero weight decay, and no
+scheduler, HERM reached mean per-chunk training loss `0.190` at seed 17 and
+`0.366` at seed 29. This demonstrates that the current graph can memorize a
+small set, while exposing meaningful initialization variance. It does not
+prove generalization or long-context memory.
+
 Commands:
 
 ```bash
@@ -48,8 +69,9 @@ Commands:
 .venv/bin/python benchmarks/run_benchmark.py --task recall --report artifacts/bench-recall-obov.json
 ```
 
-The updated harness reports loss, bits per byte, training/evaluation
-throughput, peak resident memory, state bytes and fixed expert activations. It
+The updated harness reports loss, bits per byte, both token denominators,
+standard error, training/evaluation throughput, peak resident memory, state
+bytes and fixed expert activations. It
 does not report route fraction or router accuracy because OBOV has neither.
 
 ## Required comparison protocol
