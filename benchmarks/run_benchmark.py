@@ -36,8 +36,6 @@ from koemi.training.trainer import Trainer, count_parameters_with_gradient
 MODEL_NAMES = ("koemi", "gru", "lstm")
 TASK_NAMES = ("bytes", "recall")
 VOCABULARY_SIZE = PAD_TOKEN_ID + 1
-BASELINE_PRECISION = "fp32"
-BASELINE_DEVICE = "cpu"
 BASELINE_ABLATION = "none"
 
 SUBJECTS = ("the queue", "the stack", "the buffer", "the cache", "the parser")
@@ -164,7 +162,29 @@ def evaluation_error(values: list[float]) -> float:
     return float(values_tensor.std(unbiased=True) / len(values) ** 0.5)
 
 
-def evaluate_baseline(model: RecurrentBaseline, loader: DataLoader) -> EvaluationOutcome:
+def resolve_runtime(arguments: argparse.Namespace) -> tuple[torch.device, str, torch.dtype | None]:
+    requested_device = arguments.device
+    if requested_device == "auto":
+        requested_device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = Trainer.resolve_device(requested_device)
+    precision, autocast_dtype = Trainer.resolve_precision(device, arguments.precision)
+    return device, precision, autocast_dtype
+
+
+def move_batch_to_device(batch: dict[str, Tensor], device: torch.device) -> tuple[Tensor, Tensor]:
+    non_blocking = device.type == "cuda"
+    return (
+        batch["input_ids"].to(device, non_blocking=non_blocking),
+        batch["target_ids"].to(device, non_blocking=non_blocking),
+    )
+
+
+def evaluate_baseline(
+    model: RecurrentBaseline,
+    loader: DataLoader,
+    device: torch.device,
+    autocast_dtype: torch.dtype | None,
+) -> EvaluationOutcome:
     model.eval()
     total_loss = 0.0
     total_tokens = 0
@@ -172,13 +192,14 @@ def evaluate_baseline(model: RecurrentBaseline, loader: DataLoader) -> Evaluatio
     start_time = time.perf_counter()
     with torch.no_grad():
         for batch in loader:
-            target_ids = batch["target_ids"]
+            input_ids, target_ids = move_batch_to_device(batch, device)
             supervised_mask = target_ids != IGNORE_TARGET_ID
             supervised_count = int(supervised_mask.sum())
             if supervised_count == 0:
                 continue
-            logits = model(batch["input_ids"])
-            token_loss = token_cross_entropy(logits, target_ids)
+            with Trainer.autocast_context(device, autocast_dtype):
+                logits = model(input_ids)
+                token_loss = token_cross_entropy(logits, target_ids)
             total_loss += float((token_loss * supervised_mask).sum())
             token_losses.extend(token_loss.masked_select(supervised_mask).tolist())
             total_tokens += supervised_count
@@ -192,7 +213,12 @@ def evaluate_baseline(model: RecurrentBaseline, loader: DataLoader) -> Evaluatio
     )
 
 
-def evaluate_koemi(model: KoemiModel, loader: DataLoader) -> EvaluationOutcome:
+def evaluate_koemi(
+    model: KoemiModel,
+    loader: DataLoader,
+    device: torch.device,
+    autocast_dtype: torch.dtype | None,
+) -> EvaluationOutcome:
     model.eval()
     total_loss = 0.0
     total_tokens = 0
@@ -201,13 +227,14 @@ def evaluate_koemi(model: KoemiModel, loader: DataLoader) -> EvaluationOutcome:
     start_time = time.perf_counter()
     with torch.no_grad():
         for batch in loader:
-            target_ids = batch["target_ids"]
+            input_ids, target_ids = move_batch_to_device(batch, device)
             supervised_mask = target_ids != IGNORE_TARGET_ID
             supervised_count = int(supervised_mask.sum())
             if supervised_count == 0:
                 continue
-            output = model(batch["input_ids"])
-            token_loss = token_cross_entropy(output.logits, target_ids)
+            with Trainer.autocast_context(device, autocast_dtype):
+                output = model(input_ids)
+                token_loss = token_cross_entropy(output.logits, target_ids)
             total_loss += float((token_loss * supervised_mask).sum())
             token_losses.extend(token_loss.masked_select(supervised_mask).tolist())
             total_tokens += supervised_count
@@ -227,9 +254,18 @@ def evaluate_koemi(model: KoemiModel, loader: DataLoader) -> EvaluationOutcome:
 
 
 def train_baseline(
-    model: RecurrentBaseline, loader: DataLoader, arguments: argparse.Namespace
+    model: RecurrentBaseline,
+    loader: DataLoader,
+    arguments: argparse.Namespace,
+    device: torch.device,
+    autocast_dtype: torch.dtype | None,
 ) -> BaselineTrainingOutcome:
     optimizer = torch.optim.AdamW(model.parameters(), lr=arguments.learning_rate)
+    scaler = torch.amp.GradScaler(
+        device.type,
+        enabled=device.type == "cuda" and autocast_dtype == torch.float16,
+    )
+    model.to(device)
     model.train()
     weighted_loss = 0.0
     supervised_total = 0
@@ -240,23 +276,26 @@ def train_baseline(
     for epoch_index in range(1, arguments.epochs + 1):
         learning_rate_at_epoch_start = optimizer.param_groups[0]["lr"]
         for batch in loader:
-            target_ids = batch["target_ids"]
+            input_ids, target_ids = move_batch_to_device(batch, device)
             supervised_mask = target_ids != IGNORE_TARGET_ID
             supervised_count = int(supervised_mask.sum())
             if supervised_count == 0:
                 continue
             optimizer.zero_grad(set_to_none=True)
-            logits = model(batch["input_ids"])
-            loss = functional.cross_entropy(
-                logits.reshape(-1, logits.shape[-1]),
-                target_ids.reshape(-1),
-                ignore_index=IGNORE_TARGET_ID,
-            )
-            loss.backward()
+            with Trainer.autocast_context(device, autocast_dtype):
+                logits = model(input_ids)
+                loss = functional.cross_entropy(
+                    logits.reshape(-1, logits.shape[-1]),
+                    target_ids.reshape(-1),
+                    ignore_index=IGNORE_TARGET_ID,
+                )
+            scaler.scale(loss).backward()
             if parameters_receiving_gradient == 0:
                 parameters_receiving_gradient = count_parameters_with_gradient(model)
+            scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             optimizer_steps += 1
             weighted_loss += float(loss.detach()) * supervised_count
             supervised_total += supervised_count
@@ -298,6 +337,7 @@ def build_diagnostics(
 
 def run_koemi(arguments: argparse.Namespace, model_settings: ModelSettings, loaders: tuple[DataLoader, DataLoader]) -> tuple[RunReport, RunDiagnostics]:
     train_loader, evaluation_loader = loaders
+    device, _, _ = resolve_runtime(arguments)
     torch.manual_seed(arguments.seed)
     model = KoemiModel(model_settings)
     parameter_count, parameter_bytes = count_parameter_bytes(model)
@@ -306,12 +346,13 @@ def run_koemi(arguments: argparse.Namespace, model_settings: ModelSettings, load
         batch_size=arguments.batch_size,
         epochs=arguments.epochs,
         learning_rate=arguments.learning_rate,
-        device=BASELINE_DEVICE,
+        device=str(device),
+        precision=arguments.precision,
     )
     logger = logging.getLogger("koemi-benchmark")
     logger.addHandler(logging.NullHandler())
     training = Trainer(logger).train(model, train_loader, training_settings)
-    evaluation = evaluate_koemi(model, evaluation_loader)
+    evaluation = evaluate_koemi(model, evaluation_loader, device, Trainer.resolve_precision(device, arguments.precision)[1])
     peak_memory_bytes, peak_memory_source = measure_peak_memory(training.device)
     report = build_run_report(
         model="koemi",
@@ -342,13 +383,14 @@ def run_koemi(arguments: argparse.Namespace, model_settings: ModelSettings, load
 
 def run_baseline(arguments: argparse.Namespace, target_parameter_count: int, loaders: tuple[DataLoader, DataLoader]) -> tuple[RunReport, RunDiagnostics]:
     train_loader, evaluation_loader = loaders
+    device, precision, autocast_dtype = resolve_runtime(arguments)
     hidden_size = match_hidden_size(arguments.model, arguments.embedding_size, target_parameter_count)
     torch.manual_seed(arguments.seed)
     baseline = RecurrentBaseline(arguments.model, arguments.embedding_size, hidden_size)
     parameter_count, parameter_bytes = count_parameter_bytes(baseline)
-    training = train_baseline(baseline, train_loader, arguments)
-    evaluation = evaluate_baseline(baseline, evaluation_loader)
-    peak_memory_bytes, peak_memory_source = measure_peak_memory(BASELINE_DEVICE)
+    training = train_baseline(baseline, train_loader, arguments, device, autocast_dtype)
+    evaluation = evaluate_baseline(baseline, evaluation_loader, device, autocast_dtype)
+    peak_memory_bytes, peak_memory_source = measure_peak_memory(str(device))
     report = build_run_report(
         model=arguments.model,
         parameters=parameter_count,
@@ -365,8 +407,8 @@ def run_baseline(arguments: argparse.Namespace, target_parameter_count: int, loa
         optimizer_steps=training.optimizer_steps,
         batch_size=arguments.batch_size,
         sequence_length=arguments.sequence_length,
-        precision=BASELINE_PRECISION,
-        device=BASELINE_DEVICE,
+        precision=precision,
+        device=str(device),
         ablation=BASELINE_ABLATION,
         learning_rate_by_epoch=training.learning_rate_by_epoch,
         peak_memory_bytes=peak_memory_bytes,
@@ -424,6 +466,8 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--task", choices=TASK_NAMES, default="bytes")
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--data-seed", type=int, default=DEFAULT_DATA_SEED)
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--precision", choices=("auto", "fp32", "fp16", "bf16"), default="auto")
     parser.add_argument("--train-records", type=int, default=48)
     parser.add_argument("--evaluation-records", type=int, default=16)
     parser.add_argument("--sequence-length", type=int, default=96)
@@ -449,6 +493,8 @@ def main(argument_values: list[str] | None = None) -> int:
         "task": arguments.task,
         "seed": arguments.seed,
         "data_seed": arguments.data_seed,
+        "device": arguments.device,
+        "precision": arguments.precision,
         "platform": sys.platform,
         "torch_version": torch.__version__,
         "runs": run_every_model(arguments),

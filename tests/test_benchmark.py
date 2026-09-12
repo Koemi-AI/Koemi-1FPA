@@ -26,6 +26,10 @@ TINY_BUDGET = (
     "4",
     "--local-memory-size",
     "4",
+    "--device",
+    "cpu",
+    "--precision",
+    "fp32",
 )
 
 
