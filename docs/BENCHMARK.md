@@ -58,9 +58,24 @@ directly comparable.
 
 With 20 recall records, 500 FP32 AdamW steps, zero weight decay, and no
 scheduler, HERM reached mean per-chunk training loss `0.190` at seed 17 and
-`0.366` at seed 29. This demonstrates that the current graph can memorize a
-small set, while exposing meaningful initialization variance. It does not
-prove generalization or long-context memory.
+`0.366` at seed 29. Expressed as the same natural-log unit used by bpb, these
+are approximately `0.274` and `0.528` training bpb per chunk; they are not the
+3,072-token evaluation bpb above and must not be compared as if they were.
+The almost 2x spread is an experimental constraint: every ablation must use at
+least three independent initialization seeds and report mean plus standard
+deviation. This demonstrates that the current graph can memorize a small set,
+while exposing substantial initialization variance. It does not prove
+generalization or long-context memory.
+
+### Current conclusion
+
+With an adequate standard error, HERM recall is `7.833 bpb` against the random
+ceiling of `8.0`. The overfit check confirms that the graph trains, so the
+result is not explained by blocked gradients; the associative memory simply is
+not learning the task that is supposed to justify it. The first ablation must
+be affine recurrence plus prediction head alone, followed by slow memory and
+refine, surprise, fast memory, local attention and deterministic MoE. Each
+configuration requires at least three seeds.
 
 Commands:
 
