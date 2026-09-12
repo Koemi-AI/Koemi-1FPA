@@ -18,6 +18,11 @@ class ModelSettings:
     memory_features: int = 16
     local_memory_size: int = 16
     expert_count: int = 0
+    expert_routing: str = "hash"
+    expert_top_k: int = 1
+    expert_hidden_multiplier: int = 2
+    expert_load_balance_weight: float = 0.0
+    expert_router_jitter: float = 0.0
     cache_capacity: int = 256
     scan_chunk: int = 128
     refine_decay_rate: float = 0.0625
@@ -36,12 +41,34 @@ class ModelSettings:
             raise ValueError("scan_chunk must be at least 1")
         if not 0 <= self.expert_count <= 64:
             raise ValueError("expert_count must be between 0 and 64")
+        self.validate_expert_settings()
         if self.cache_capacity < 1:
             raise ValueError("cache_capacity must be at least 1")
         if not 0.0 < self.refine_decay_rate <= 1.0:
             raise ValueError("refine_decay_rate must be greater than zero and at most one")
         if self.ablation not in {"herm", "no_refine", "no_surprise", "affine"}:
             raise ValueError("ablation must be herm, no_refine, no_surprise or affine")
+
+    def validate_expert_settings(self) -> None:
+        if self.expert_routing not in {"hash", "learned"}:
+            raise ValueError("expert_routing must be hash or learned")
+        if self.expert_hidden_multiplier < 1:
+            raise ValueError("expert_hidden_multiplier must be at least one")
+        if self.expert_load_balance_weight < 0.0:
+            raise ValueError("expert_load_balance_weight must be non-negative")
+        if self.expert_router_jitter < 0.0:
+            raise ValueError("expert_router_jitter must be non-negative")
+        if not 1 <= self.expert_top_k <= max(1, self.expert_count):
+            raise ValueError("expert_top_k must be between one and expert_count")
+        if self.expert_routing == "learned" and self.expert_count < 2:
+            raise ValueError("learned expert routing requires at least two experts")
+        if self.expert_routing == "hash":
+            if self.expert_top_k > 1:
+                raise ValueError("hash expert routing dispatches one expert, so expert_top_k must be one")
+            if self.expert_load_balance_weight > 0.0:
+                raise ValueError("hash expert routing has no gate to balance")
+            if self.expert_router_jitter > 0.0:
+                raise ValueError("hash expert routing has no router to perturb")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

@@ -35,6 +35,7 @@ class TrainingResult:
     mean_loss: float
     mean_task_loss: float
     mean_thinking_loss: float
+    mean_router_loss: float
     mean_surprise: float
     supervised_token_count: int
     token_count: int
@@ -103,6 +104,7 @@ class Trainer:
                         thinking_mask,
                         settings.thinking_loss_weight,
                         settings.label_smoothing,
+                        model.settings.expert_load_balance_weight,
                     )
                     scaled_loss = objective.total_loss / settings.gradient_accumulation_steps
                 scaler.scale(scaled_loss).backward()
@@ -135,13 +137,15 @@ class Trainer:
                 validation_seconds_inside_elapsed += time.perf_counter() - validation_start_time
                 final_validation = validation
             self.logger.info(
-                "epoch_completed epoch=%s loss=%.6f task_loss=%.6f thinking_loss=%.6f surprise=%.4f "
+                "epoch_completed epoch=%s loss=%.6f task_loss=%.6f thinking_loss=%.6f "
+                "router_loss=%.6f surprise=%.4f "
                 "validation_loss=%s validation_perplexity=%s learning_rate=%.8f optimizer_steps=%s "
                 "supervised_tokens=%s tokens=%s expert_activations=%s precision=%s",
                 epoch_index,
                 epoch_metrics.mean_loss,
                 epoch_metrics.mean_task_loss,
                 epoch_metrics.mean_thinking_loss,
+                epoch_metrics.mean_router_loss,
                 epoch_metrics.mean_surprise,
                 f"{validation.mean_loss:.6f}" if validation else "none",
                 f"{math.exp(min(validation.mean_loss, 80.0)):.6f}" if validation else "none",
@@ -191,6 +195,7 @@ class Trainer:
                         thinking_mask,
                         settings.thinking_loss_weight,
                         settings.label_smoothing,
+                        model.settings.expert_load_balance_weight,
                     )
                 metrics.add(output, objective, supervised_count)
         model.train()
@@ -273,6 +278,7 @@ class MetricAccumulator:
         self.weighted_loss = 0.0
         self.weighted_task_loss = 0.0
         self.weighted_thinking_loss = 0.0
+        self.weighted_router_loss = 0.0
         self.surprise_total = 0.0
         self.supervised_token_count = 0
         self.token_count = 0
@@ -282,6 +288,7 @@ class MetricAccumulator:
         self.weighted_loss += float(objective.total_loss.detach()) * supervised_count
         self.weighted_task_loss += float(objective.task_loss.detach()) * supervised_count
         self.weighted_thinking_loss += float(objective.thinking_loss.detach()) * supervised_count
+        self.weighted_router_loss += float(objective.router_loss.detach()) * supervised_count
         self.surprise_total += float(output.surprise_values.masked_select(output.valid_positions).sum().detach())
         self.supervised_token_count += supervised_count
         self.token_count += output.token_count
@@ -297,6 +304,7 @@ class MetricAccumulator:
         self.weighted_loss += other.weighted_loss
         self.weighted_task_loss += other.weighted_task_loss
         self.weighted_thinking_loss += other.weighted_thinking_loss
+        self.weighted_router_loss += other.weighted_router_loss
         self.surprise_total += other.surprise_total
         self.supervised_token_count += other.supervised_token_count
         self.token_count += other.token_count
@@ -318,6 +326,10 @@ class MetricAccumulator:
         return self.average(self.weighted_thinking_loss)
 
     @property
+    def mean_router_loss(self) -> float:
+        return self.average(self.weighted_router_loss)
+
+    @property
     def mean_surprise(self) -> float:
         return self.surprise_total / self.token_count if self.token_count else 0.0
 
@@ -327,6 +339,7 @@ class MetricAccumulator:
             self.mean_loss,
             self.mean_task_loss,
             self.mean_thinking_loss,
+            self.mean_router_loss,
             self.mean_surprise,
             self.supervised_token_count,
             self.token_count,

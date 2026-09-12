@@ -15,6 +15,7 @@ class TrainingObjective:
     task_loss: Tensor
     thinking_loss: Tensor
     total_loss: Tensor
+    router_loss: Tensor
 
 
 def token_cross_entropy(logits: Tensor, target_ids: Tensor, label_smoothing: float = 0.0) -> Tensor:
@@ -34,9 +35,12 @@ def calculate_training_objective(
     thinking_mask: Tensor,
     thinking_loss_weight: float,
     label_smoothing: float = 0.0,
+    router_loss_weight: float = 0.0,
 ) -> TrainingObjective:
     if thinking_loss_weight < 0.0:
         raise ValueError("thinking_loss_weight must be non-negative")
+    if router_loss_weight < 0.0:
+        raise ValueError("router_loss_weight must be non-negative")
     supervised_mask = target_ids != IGNORE_TARGET_ID
     supervised_count = int(supervised_mask.sum())
     if supervised_count == 0:
@@ -59,5 +63,7 @@ def calculate_training_objective(
     effective_weight = weights.masked_select(supervised_mask).sum()
     if float(effective_weight.detach()) <= 0.0:
         raise ValueError("thinking_loss_weight removes every supervised target token")
-    total_loss = (token_loss * weights * supervised_mask).sum() / effective_weight
-    return TrainingObjective(task_loss, thinking_loss, total_loss)
+    token_objective = (token_loss * weights * supervised_mask).sum() / effective_weight
+    router_loss = output.router_loss
+    total_loss = token_objective + router_loss_weight * router_loss
+    return TrainingObjective(task_loss, thinking_loss, total_loss, router_loss)
