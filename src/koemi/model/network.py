@@ -10,7 +10,7 @@ from torch.nn import functional
 from koemi.configuration.settings import ModelSettings, PAD_TOKEN_ID
 from koemi.model.cache import CachedMapping, DiskMappingCache, WarmTokenCache
 from koemi.model.execution import ExecutionMode
-from koemi.model.experts import ExpertMixture
+from koemi.model.experts import ExpertMixture, RouterStatistics, merge_router_statistics
 from koemi.model.layers import RootMeanSquareNorm
 from koemi.model.memory import (
     BoundedRecurrentState,
@@ -34,6 +34,7 @@ class KoemiOutput:
     cache_misses: int
     expert_count: int
     router_loss: Tensor
+    router_statistics: RouterStatistics | None = None
 
     @property
     def expert_activation_counts(self) -> tuple[int, ...]:
@@ -260,6 +261,7 @@ class KoemiModel(nn.Module):
             cache_misses=cache_misses,
             expert_count=self.settings.expert_count,
             router_loss=expert_output.load_balance,
+            router_statistics=expert_output.router_statistics,
         )
 
     def forward_affine_window(
@@ -309,7 +311,7 @@ class KoemiModel(nn.Module):
         surprise_by_position: list[Tensor] = []
         expert_indices_by_position: list[Tensor] = []
         valid_by_position: list[Tensor] = []
-        load_balance_by_position: list[Tensor] = []
+        router_statistics_by_position: list[RouterStatistics | None] = []
         cache_hits = 0
         cache_misses = 0
         for position in range(length):
@@ -384,7 +386,7 @@ class KoemiModel(nn.Module):
                 positions.unsqueeze(1),
                 valid_mask.unsqueeze(1),
             )
-            load_balance_by_position.append(expert_output.load_balance)
+            router_statistics_by_position.append(expert_output.router_statistics)
             logits_by_position.append(self.predict_tokens(expert_output.context[:, 0]))
             surprise_by_position.append(surprise)
             expert_indices_by_position.append(expert_output.assignment[:, 0])
@@ -453,6 +455,7 @@ class KoemiModel(nn.Module):
         valid_positions = torch.stack(valid_by_position, dim=1)
         expert_indices = torch.stack(expert_indices_by_position, dim=1)
         logits = torch.stack(logits_by_position, dim=1)
+        router_statistics = merge_router_statistics(router_statistics_by_position)
         return KoemiOutput(
             logits=logits,
             state=current_state,
@@ -463,11 +466,8 @@ class KoemiModel(nn.Module):
             cache_hits=cache_hits,
             cache_misses=cache_misses,
             expert_count=self.settings.expert_count,
-            router_loss=(
-                torch.stack(load_balance_by_position).mean()
-                if load_balance_by_position
-                else logits.new_zeros(())
-            ),
+            router_loss=router_statistics.load_balance() if router_statistics is not None else logits.new_zeros(()),
+            router_statistics=router_statistics,
         )
 
     def calculate_surprise(self, prior_states: Tensor, input_ids: Tensor, valid_mask: Tensor) -> Tensor:
@@ -585,6 +585,7 @@ class KoemiModel(nn.Module):
 
 def concatenate_outputs(windows: list[KoemiOutput]) -> KoemiOutput:
     token_count = sum(window.token_count for window in windows)
+    router_statistics = merge_router_statistics([window.router_statistics for window in windows])
     return KoemiOutput(
         logits=torch.cat([window.logits for window in windows], dim=1),
         state=windows[-1].state,
@@ -595,12 +596,6 @@ def concatenate_outputs(windows: list[KoemiOutput]) -> KoemiOutput:
         cache_hits=sum(window.cache_hits for window in windows),
         cache_misses=sum(window.cache_misses for window in windows),
         expert_count=windows[0].expert_count,
-        router_loss=average_router_loss(windows, token_count),
+        router_loss=router_statistics.load_balance() if router_statistics is not None else windows[0].router_loss,
+        router_statistics=router_statistics,
     )
-
-
-def average_router_loss(windows: list[KoemiOutput], token_count: int) -> Tensor:
-    if token_count == 0:
-        return windows[0].router_loss
-    weighted = sum(window.router_loss * window.token_count for window in windows)
-    return weighted / token_count

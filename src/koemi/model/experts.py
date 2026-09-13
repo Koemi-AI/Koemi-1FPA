@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
@@ -22,10 +23,26 @@ GATE_EPSILON = 1e-9
 
 
 @dataclass(frozen=True)
+class RouterStatistics:
+    probability_mass: Tensor
+    expert_occupancy: Tensor
+    valid_count: Tensor
+    expert_count: int
+    top_k: int
+
+    def load_balance(self) -> Tensor:
+        normalized_count = self.valid_count.to(self.probability_mass.dtype).clamp_min(1.0)
+        importance = self.probability_mass / normalized_count
+        fraction = self.expert_occupancy.to(self.probability_mass.dtype) / (normalized_count * self.top_k)
+        return self.expert_count * (fraction * importance).sum()
+
+
+@dataclass(frozen=True)
 class ExpertOutput:
     context: Tensor
     assignment: Tensor
     load_balance: Tensor
+    router_statistics: RouterStatistics | None = None
 
 
 @dataclass(frozen=True)
@@ -34,6 +51,32 @@ class RouterDecision:
     gate_weights: Tensor
     primary_expert: Tensor
     load_balance: Tensor
+    router_statistics: RouterStatistics
+
+
+def merge_router_statistics(
+    statistics: Sequence[RouterStatistics | None],
+) -> RouterStatistics | None:
+    present_statistics = tuple(statistic for statistic in statistics if statistic is not None)
+    if not present_statistics:
+        return None
+    first = present_statistics[0]
+    if any(
+        statistic.expert_count != first.expert_count or statistic.top_k != first.top_k
+        for statistic in present_statistics[1:]
+    ):
+        raise ValueError("router statistics must use the same expert count and top_k")
+    return RouterStatistics(
+        probability_mass=torch.stack(
+            [statistic.probability_mass for statistic in present_statistics], dim=0
+        ).sum(dim=0),
+        expert_occupancy=torch.stack(
+            [statistic.expert_occupancy for statistic in present_statistics], dim=0
+        ).sum(dim=0),
+        valid_count=torch.stack([statistic.valid_count for statistic in present_statistics], dim=0).sum(),
+        expert_count=first.expert_count,
+        top_k=first.top_k,
+    )
 
 
 class ExpertBank(nn.Module):
@@ -74,17 +117,33 @@ class ExpertBank(nn.Module):
             self.output_bias.unbind(0),
         )
 
+    def apply_pairs(self, values: Tensor, expert_indices: Tensor) -> Tensor:
+        if values.shape[0] != expert_indices.shape[0]:
+            raise ValueError("values and expert_indices must have the same number of rows")
+        if values.shape[0] == 0:
+            return values.new_empty((0, self.width))
+        gate = torch.bmm(
+            values.unsqueeze(1), self.gate_weight.index_select(0, expert_indices)
+        ).squeeze(1) + self.gate_bias.index_select(0, expert_indices)
+        projected = torch.bmm(
+            values.unsqueeze(1), self.value_weight.index_select(0, expert_indices)
+        ).squeeze(1) + self.value_bias.index_select(0, expert_indices)
+        activated = functional.silu(gate) * projected
+        return torch.bmm(
+            activated.unsqueeze(1), self.output_weight.index_select(0, expert_indices)
+        ).squeeze(1) + self.output_bias.index_select(0, expert_indices)
+
     def apply_groups(self, groups: tuple[Tensor, ...]) -> list[Tensor]:
-        gate_weights, gate_biases, value_weights, value_biases, output_weights, output_biases = (
-            self.unbound_parameters()
+        if len(groups) != self.expert_count:
+            raise ValueError("groups must contain one tensor per expert")
+        group_sizes = tuple(group.shape[0] for group in groups)
+        values = torch.cat(groups, dim=0)
+        expert_indices = torch.repeat_interleave(
+            torch.arange(self.expert_count, device=values.device),
+            torch.tensor(group_sizes, dtype=torch.long, device=values.device),
         )
-        outputs = []
-        for expert_index, values in enumerate(groups):
-            gate = torch.addmm(gate_biases[expert_index], values, gate_weights[expert_index])
-            projected = torch.addmm(value_biases[expert_index], values, value_weights[expert_index])
-            activated = functional.silu(gate) * projected
-            outputs.append(torch.addmm(output_biases[expert_index], activated, output_weights[expert_index]))
-        return outputs
+        outputs = self.apply_pairs(values, expert_indices)
+        return list(torch.split(outputs, group_sizes))
 
 
 class ExpertRouter(nn.Module):
@@ -112,21 +171,35 @@ class ExpertRouter(nn.Module):
         expert_indices = torch.where(
             keep, selected_indices, torch.full_like(selected_indices, UNASSIGNED_EXPERT)
         )
+        router_statistics = self.build_statistics(probabilities, expert_indices, valid_flat)
         return RouterDecision(
             expert_indices=expert_indices,
             gate_weights=torch.where(keep, gate_weights, torch.zeros_like(gate_weights)),
             primary_expert=expert_indices[:, 0],
-            load_balance=self.load_balance(probabilities, expert_indices, valid_flat),
+            load_balance=router_statistics.load_balance(),
+            router_statistics=router_statistics,
         )
 
     def load_balance(self, probabilities: Tensor, expert_indices: Tensor, valid_flat: Tensor) -> Tensor:
-        valid_count = valid_flat.sum().to(probabilities.dtype).clamp_min(1.0)
-        importance = (probabilities * valid_flat.unsqueeze(-1)).sum(dim=0) / valid_count
-        occupancy = torch.bincount(
+        return self.build_statistics(probabilities, expert_indices, valid_flat).load_balance()
+
+    def build_statistics(
+        self,
+        probabilities: Tensor,
+        expert_indices: Tensor,
+        valid_flat: Tensor,
+    ) -> RouterStatistics:
+        probability_mass = (probabilities * valid_flat.unsqueeze(-1)).sum(dim=0)
+        expert_occupancy = torch.bincount(
             expert_indices.reshape(-1) + 1, minlength=self.expert_count + 1
         )[1:]
-        fraction = occupancy.to(probabilities.dtype) / (valid_count * self.top_k)
-        return self.expert_count * (fraction * importance).sum()
+        return RouterStatistics(
+            probability_mass=probability_mass,
+            expert_occupancy=expert_occupancy,
+            valid_count=valid_flat.sum(),
+            expert_count=self.expert_count,
+            top_k=self.top_k,
+        )
 
 
 class ExpertMixture(nn.Module):
@@ -140,11 +213,28 @@ class ExpertMixture(nn.Module):
         router_jitter: float = 0.0,
     ) -> None:
         super().__init__()
+        if expert_count < 0:
+            raise ValueError("expert_count must be non-negative")
+        if hidden_multiplier < 1:
+            raise ValueError("hidden_multiplier must be at least one")
+        if router_jitter < 0.0:
+            raise ValueError("router_jitter must be non-negative")
         if routing not in ROUTING_NAMES:
             raise ValueError(f"routing must be one of {ROUTING_NAMES}")
+        if expert_count == 0:
+            if top_k != 1:
+                raise ValueError("top_k must be one when expert_count is zero")
+        elif not 1 <= top_k <= expert_count:
+            raise ValueError("top_k must be between one and the expert count")
+        if routing == LEARNED_ROUTING and expert_count < 2:
+            raise ValueError("learned expert routing requires at least two experts")
+        if routing == HASH_ROUTING and top_k != 1:
+            raise ValueError("hash expert routing dispatches one expert, so top_k must be one")
+        if routing == HASH_ROUTING and router_jitter > 0.0:
+            raise ValueError("hash expert routing has no router to perturb")
         self.expert_count = expert_count
         self.routing = routing
-        self.top_k = top_k if expert_count > 0 else 1
+        self.top_k = top_k
         if expert_count > 0:
             self.expert_bank = ExpertBank(expert_count, embedding_size, hidden_multiplier)
             self.output_normalizer = RootMeanSquareNorm(embedding_size)
@@ -186,6 +276,7 @@ class ExpertMixture(nn.Module):
             context=mixed.reshape_as(context),
             assignment=decision.primary_expert.reshape_as(token_ids),
             load_balance=decision.load_balance,
+            router_statistics=decision.router_statistics,
         )
 
     def assign(
@@ -216,25 +307,20 @@ class ExpertMixture(nn.Module):
     ) -> Tensor:
         top_k = expert_indices.shape[1]
         pair_expert = expert_indices.reshape(-1)
-        order = torch.argsort(pair_expert, stable=True)
-        occupancy = torch.bincount(pair_expert + 1, minlength=self.expert_count + 1).tolist()
-        group_sizes = occupancy[1:]
-        dispatched_pairs = order.narrow(0, occupancy[0], sum(group_sizes))
-        rows = (
-            dispatched_pairs
-            if top_k == 1
-            else dispatched_pairs.div(top_k, rounding_mode="floor")
+        pair_rows = torch.arange(flat_context.shape[0], device=flat_context.device).repeat_interleave(top_k)
+        pair_valid = (
+            pair_expert.ge(0)
+            & pair_expert.lt(self.expert_count)
+            & valid_flat.repeat_interleave(top_k)
         )
-        groups = torch.split(flat_context.index_select(0, rows), group_sizes)
-        dispatched_output = torch.cat(self.expert_bank.apply_groups(groups))
+        dispatched_experts = pair_expert.clamp(0, self.expert_count - 1)
+        dispatched_values = flat_context.index_select(0, pair_rows)
+        dispatched_output = self.expert_bank.apply_pairs(dispatched_values, dispatched_experts)
         if gate_weights is not None:
-            pair_weights = gate_weights.reshape(-1).index_select(0, dispatched_pairs)
+            pair_weights = gate_weights.reshape(-1)
             dispatched_output = dispatched_output * pair_weights.unsqueeze(-1)
-        empty_delta = torch.zeros_like(flat_context)
-        delta = (
-            empty_delta.index_copy(0, rows, dispatched_output)
-            if top_k == 1
-            else empty_delta.index_add(0, rows, dispatched_output)
-        )
+        dispatched_output = dispatched_output * pair_valid.to(dispatched_output.dtype).unsqueeze(-1)
+        delta = torch.zeros_like(flat_context)
+        delta.index_add_(0, pair_rows, dispatched_output)
         mixed = self.output_normalizer(flat_context + delta)
         return torch.where(valid_flat.unsqueeze(-1), mixed, flat_context)
