@@ -23,7 +23,6 @@ def run_one(
     data_seed: int,
     device: str,
     precision: str,
-    compile_model: bool,
     train_records: int,
     evaluation_records: int,
     sequence_length: int,
@@ -49,7 +48,6 @@ def run_one(
         device,
         "--precision",
         precision,
-        *( ["--compile"] if compile_model else [] ),
         "--train-records",
         str(train_records),
         "--evaluation-records",
@@ -91,7 +89,6 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-seed", type=int, default=DEFAULT_DATA_SEED)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--precision", choices=("auto", "fp32", "fp16", "bf16"), default="auto")
-    parser.add_argument("--compile", action="store_true", help="Compile model forward with torch.compile")
     parser.add_argument("--train-records", type=int, default=16)
     parser.add_argument("--evaluation-records", type=int, default=1024)
     parser.add_argument("--sequence-length", type=int, default=96)
@@ -119,7 +116,6 @@ def main(argument_values: list[str] | None = None) -> int:
                 arguments.data_seed,
                 arguments.device,
                 arguments.precision,
-                arguments.compile,
                 arguments.train_records,
                 arguments.evaluation_records,
                 arguments.sequence_length,

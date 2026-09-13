@@ -54,7 +54,6 @@ class RunDiagnostics:
     validation_seconds_outside_elapsed: float
     validation_tokens_per_second: float
     expert_activation_counts: tuple[int, ...] | None
-    compiled: bool
 
 
 @dataclass(frozen=True)
@@ -333,7 +332,6 @@ def build_diagnostics(
         validation_seconds_outside_elapsed=evaluation.elapsed_seconds,
         validation_tokens_per_second=evaluation.supervised_tokens / evaluation.elapsed_seconds,
         expert_activation_counts=evaluation.expert_activation_counts,
-        compiled=arguments.compile,
     )
 
 
@@ -342,8 +340,6 @@ def run_koemi(arguments: argparse.Namespace, model_settings: ModelSettings, load
     device, _, _ = resolve_runtime(arguments)
     torch.manual_seed(arguments.seed)
     model = KoemiModel(model_settings)
-    if arguments.compile:
-        model = torch.compile(model, dynamic=True)
     parameter_count, parameter_bytes = count_parameter_bytes(model)
     training_settings = TrainingSettings(
         sequence_length=arguments.sequence_length,
@@ -391,8 +387,6 @@ def run_baseline(arguments: argparse.Namespace, target_parameter_count: int, loa
     hidden_size = match_hidden_size(arguments.model, arguments.embedding_size, target_parameter_count)
     torch.manual_seed(arguments.seed)
     baseline = RecurrentBaseline(arguments.model, arguments.embedding_size, hidden_size)
-    if arguments.compile:
-        baseline = torch.compile(baseline, dynamic=True)
     parameter_count, parameter_bytes = count_parameter_bytes(baseline)
     training = train_baseline(baseline, train_loader, arguments, device, autocast_dtype)
     evaluation = evaluate_baseline(baseline, evaluation_loader, device, autocast_dtype)
@@ -458,10 +452,6 @@ def run_every_model(arguments: argparse.Namespace) -> list[dict]:
         for key, value in vars(arguments).items():
             if key in {"model", "report"}:
                 continue
-            if isinstance(value, bool):
-                if value:
-                    command.append(f"--{key.replace('_', '-')}")
-                continue
             command.extend([f"--{key.replace('_', '-')}", str(value)])
         completed = subprocess.run(command, capture_output=True, text=True, check=False)
         if completed.returncode != 0:
@@ -478,7 +468,6 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-seed", type=int, default=DEFAULT_DATA_SEED)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--precision", choices=("auto", "fp32", "fp16", "bf16"), default="auto")
-    parser.add_argument("--compile", action="store_true", help="Compile model forward with torch.compile")
     parser.add_argument("--train-records", type=int, default=48)
     parser.add_argument("--evaluation-records", type=int, default=16)
     parser.add_argument("--sequence-length", type=int, default=96)

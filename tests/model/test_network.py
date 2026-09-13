@@ -39,52 +39,6 @@ class KoemiModelTests(unittest.TestCase):
         parameter_count = sum(parameter.numel() for parameter in model.parameters())
         self.assertEqual(parameter_count, count_parameters_with_gradient(model))
 
-    def test_fused_recurrent_projection_matches_two_linear_projections(self) -> None:
-        model = self.build_model(expert_count=0)
-        input_state = torch.randn(2, model.settings.embedding_size)
-        width = model.settings.embedding_size
-        fused = model.recurrent_state.gate_projection(input_state)
-        expected_retention = torch.nn.functional.linear(
-            input_state,
-            model.recurrent_state.gate_projection.weight[:width],
-            model.recurrent_state.gate_projection.bias[:width],
-        )
-        expected_candidate = torch.nn.functional.linear(
-            input_state,
-            model.recurrent_state.gate_projection.weight[width:],
-            model.recurrent_state.gate_projection.bias[width:],
-        )
-        actual_retention, actual_candidate = fused.chunk(2, dim=-1)
-        self.assertTrue(torch.allclose(expected_retention, actual_retention, atol=1e-6))
-        self.assertTrue(torch.allclose(expected_candidate, actual_candidate, atol=1e-6))
-
-    def test_fused_memory_projection_matches_split_projection_math(self) -> None:
-        model = self.build_model(expert_count=0)
-        source = torch.randn(2, model.settings.embedding_size)
-        projection = model.associative_memory.project(source)
-        width = model.settings.embedding_size
-        key, value, decay, write_weight = model.associative_memory.project_projection(source).split(
-            (width, width, 1, 1), dim=-1
-        )
-        expected_decay = model.associative_memory.minimum_decay + (
-            model.associative_memory.maximum_decay - model.associative_memory.minimum_decay
-        ) * torch.sigmoid(decay)
-        self.assertTrue(torch.allclose(projection.value, torch.tanh(value), atol=1e-6))
-        self.assertTrue(torch.allclose(projection.features, torch.softmax(model.associative_memory.feature_projection(key), dim=-1), atol=1e-6))
-        self.assertTrue(torch.allclose(projection.decay, expected_decay, atol=1e-6))
-        self.assertTrue(torch.allclose(projection.write_weight, torch.sigmoid(write_weight).squeeze(-1), atol=1e-6))
-
-    def test_preallocated_local_memory_concatenation_preserves_gradients(self) -> None:
-        memory = self.build_model(expert_count=0).local_memory
-        first = torch.randn(2, 3, 16, requires_grad=True)
-        second = torch.randn(2, 2, 16, requires_grad=True)
-        result = memory.concatenate_sequence(first, second)
-        self.assertTrue(torch.allclose(result[:, :3], first, atol=1e-6))
-        self.assertTrue(torch.allclose(result[:, 3:], second, atol=1e-6))
-        result.square().sum().backward()
-        self.assertIsNotNone(first.grad)
-        self.assertIsNotNone(second.grad)
-
     def test_affine_ablation_is_a_memory_free_control(self) -> None:
         model = self.build_model(ablation="affine", expert_count=4)
         input_ids = torch.tensor([[65, 66, 67]], dtype=torch.long)

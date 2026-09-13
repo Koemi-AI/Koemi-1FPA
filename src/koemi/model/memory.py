@@ -14,15 +14,15 @@ NEGATIVE_INFINITY = float("-inf")
 class BoundedRecurrentState(nn.Module):
     def __init__(self, embedding_size: int) -> None:
         super().__init__()
-        self.gate_projection = nn.Linear(embedding_size, embedding_size * 2)
+        self.retention_projection = nn.Linear(embedding_size, embedding_size)
+        self.candidate_projection = nn.Linear(embedding_size, embedding_size)
         self.minimum_retention = 2.0**-8
         self.maximum_retention = 1.0 - 2.0**-8
 
     def gates(self, input_state: Tensor) -> tuple[Tensor, Tensor]:
-        retention_logits, candidate_logits = self.gate_projection(input_state).chunk(2, dim=-1)
-        retention = torch.sigmoid(retention_logits)
+        retention = torch.sigmoid(self.retention_projection(input_state))
         bounded_retention = self.minimum_retention + (self.maximum_retention - self.minimum_retention) * retention
-        candidate_state = torch.tanh(candidate_logits)
+        candidate_state = torch.tanh(self.candidate_projection(input_state))
         return bounded_retention, (1.0 - bounded_retention) * candidate_state
 
     def forward(self, previous_state: Tensor, input_state: Tensor) -> Tensor:
@@ -48,9 +48,12 @@ class MemoryWriteTerms:
 class HierarchicalAssociativeMemory(nn.Module):
     def __init__(self, embedding_size: int, memory_features: int, refine_decay_rate: float) -> None:
         super().__init__()
-        self.project_projection = nn.Linear(embedding_size, embedding_size * 2 + 2)
+        self.key_projection = nn.Linear(embedding_size, embedding_size)
         self.query_projection = nn.Linear(embedding_size, embedding_size)
+        self.value_projection = nn.Linear(embedding_size, embedding_size)
         self.feature_projection = nn.Linear(embedding_size, memory_features)
+        self.decay_projection = nn.Linear(embedding_size, 1)
+        self.write_projection = nn.Linear(embedding_size, 1)
         self.refine_decay_rate = refine_decay_rate
         self.minimum_decay = 2.0**-12
         self.maximum_decay = 1.0 - 2.0**-12
@@ -58,14 +61,12 @@ class HierarchicalAssociativeMemory(nn.Module):
         self.epsilon = 2.0**-8
 
     def project(self, write_source: Tensor) -> MemoryProjection:
-        key, value, decay, write_weight = self.project_projection(write_source).split(
-            (write_source.shape[-1], write_source.shape[-1], 1, 1), dim=-1
-        )
+        key = self.key_projection(write_source)
         features = torch.softmax(self.feature_projection(key), dim=-1)
-        value = torch.tanh(value)
-        decay = torch.sigmoid(decay)
+        value = torch.tanh(self.value_projection(write_source))
+        decay = torch.sigmoid(self.decay_projection(write_source))
         bounded_decay = self.minimum_decay + (self.maximum_decay - self.minimum_decay) * decay
-        write_weight = torch.sigmoid(write_weight).squeeze(-1)
+        write_weight = torch.sigmoid(self.write_projection(write_source)).squeeze(-1)
         return MemoryProjection(value, features, bounded_decay, write_weight)
 
     def read(self, memory_basis: Tensor, memory_normalizer: Tensor, query_source: Tensor) -> tuple[Tensor, Tensor]:
@@ -171,15 +172,15 @@ class LocalKeyValueMemory(nn.Module):
         batch_size, length, width = queries.shape
         window = self.local_memory_size
         carried_length = carried_keys.shape[1]
-        all_keys = self.concatenate_sequence(carried_keys, keys)
-        all_values = self.concatenate_sequence(carried_values, values)
-        all_valid = self.concatenate_sequence(carried_valid, valid_mask)
+        all_keys = torch.cat((carried_keys, keys), dim=1)
+        all_values = torch.cat((carried_values, values), dim=1)
+        all_valid = torch.cat((carried_valid, valid_mask), dim=1)
         leading_keys = all_keys.new_zeros(batch_size, window, width)
         leading_values = all_values.new_zeros(batch_size, window, width)
         leading_valid = torch.zeros(batch_size, window, dtype=torch.bool, device=queries.device)
-        padded_keys = self.concatenate_sequence(leading_keys, all_keys)
-        padded_values = self.concatenate_sequence(leading_values, all_values)
-        padded_valid = self.concatenate_sequence(leading_valid, all_valid)
+        padded_keys = torch.cat((leading_keys, all_keys), dim=1)
+        padded_values = torch.cat((leading_values, all_values), dim=1)
+        padded_valid = torch.cat((leading_valid, all_valid), dim=1)
         start = carried_length
         key_windows = padded_keys.unfold(1, window, 1)[:, start : start + length]
         value_windows = padded_values.unfold(1, window, 1)[:, start : start + length]
@@ -207,9 +208,9 @@ class LocalKeyValueMemory(nn.Module):
         values: Tensor,
         valid_mask: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        all_keys = self.concatenate_sequence(carried_keys, keys)
-        all_values = self.concatenate_sequence(carried_values, values)
-        all_valid = self.concatenate_sequence(carried_valid, valid_mask)
+        all_keys = torch.cat((carried_keys, keys), dim=1)
+        all_values = torch.cat((carried_values, values), dim=1)
+        all_valid = torch.cat((carried_valid, valid_mask), dim=1)
         if all_keys.shape[1] <= self.local_memory_size:
             return all_keys, all_values, all_valid
         return (
@@ -227,9 +228,9 @@ class LocalKeyValueMemory(nn.Module):
         value: Tensor,
         valid: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        next_keys = self.concatenate_sequence(local_keys, key.unsqueeze(1))
-        next_values = self.concatenate_sequence(local_values, value.unsqueeze(1))
-        next_valid = self.concatenate_sequence(local_valid, valid.unsqueeze(1))
+        next_keys = torch.cat((local_keys, key.unsqueeze(1)), dim=1)
+        next_values = torch.cat((local_values, value.unsqueeze(1)), dim=1)
+        next_valid = torch.cat((local_valid, valid.unsqueeze(1)), dim=1)
         if next_keys.shape[1] <= self.local_memory_size:
             return next_keys, next_values, next_valid
         return (
@@ -237,11 +238,3 @@ class LocalKeyValueMemory(nn.Module):
             next_values[:, -self.local_memory_size :],
             next_valid[:, -self.local_memory_size :],
         )
-
-    @staticmethod
-    def concatenate_sequence(first: Tensor, second: Tensor) -> Tensor:
-        first_length = first.shape[1]
-        result = first.new_empty(*first.shape[:1], first_length + second.shape[1], *first.shape[2:])
-        result[:, :first_length] = first
-        result[:, first_length:] = second
-        return result
