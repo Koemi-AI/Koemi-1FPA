@@ -8,7 +8,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 from koemi.cli import main, write_utf8
-from koemi.observability.report import RunReport
 
 
 CANONICAL_RECORD = {
@@ -109,74 +108,3 @@ class CliCommandTests(unittest.TestCase):
                 ]
             )
             self.assertEqual(0, status)
-
-    def test_train_writes_the_standard_run_report(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            workspace = Path(temporary_directory)
-            dataset_path = workspace / "dataset.jsonl"
-            records = [dict(CANONICAL_RECORD, id=f"queue-{index:03d}") for index in range(4)]
-            dataset_path.write_text(
-                "\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8"
-            )
-            report_path = workspace / "report.json"
-            status = main(
-                [
-                    "train",
-                    "--dataset",
-                    str(dataset_path),
-                    "--checkpoint",
-                    str(workspace / "model.pt"),
-                    "--epochs",
-                    "1",
-                    "--embedding-size",
-                    "16",
-                    "--memory-features",
-                    "4",
-                    "--local-memory-size",
-                    "4",
-                    "--validation-fraction",
-                    "0.5",
-                    "--device",
-                    "cpu",
-                    "--report",
-                    str(report_path),
-                ]
-            )
-            self.assertEqual(0, status)
-            report = RunReport.from_dict(json.loads(report_path.read_text(encoding="utf-8")))
-            self.assertEqual("koemi", report.model)
-            self.assertEqual("cpu", report.device)
-            self.assertEqual("fp32", report.precision)
-            self.assertGreater(report.validation_seconds_inside_elapsed, 0.0)
-            self.assertGreater(
-                report.train_tokens_per_second_excluding_validation,
-                report.train_tokens_per_second_including_validation,
-            )
-
-    def test_train_report_requires_a_validation_split(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            workspace = Path(temporary_directory)
-            dataset_path = workspace / "dataset.jsonl"
-            dataset_path.write_text(json.dumps(CANONICAL_RECORD) + "\n", encoding="utf-8")
-            status = main(
-                [
-                    "train",
-                    "--dataset",
-                    str(dataset_path),
-                    "--checkpoint",
-                    str(workspace / "model.pt"),
-                    "--epochs",
-                    "1",
-                    "--embedding-size",
-                    "16",
-                    "--memory-features",
-                    "4",
-                    "--local-memory-size",
-                    "4",
-                    "--device",
-                    "cpu",
-                    "--report",
-                    str(workspace / "report.json"),
-                ]
-            )
-            self.assertEqual(2, status)

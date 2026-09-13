@@ -3,66 +3,6 @@
 This file separates historical Koemi-1FPA measurements from Koemi-2OBOV
 measurements. The old numbers must not be quoted as OBOV results.
 
-## Standard run report
-
-Every training run, benchmark and baseline emits the same JSON object. The
-schema does not change with the architecture: `koemi`, `gru` and `lstm` produce
-the same keys, and an ablation is a field rather than a different shape. A
-`RunReport` validates itself on construction, so a report that disagrees with
-its own derived fields raises instead of being written.
-
-| Field | Meaning |
-| --- | --- |
-| `model` | `koemi`, `gru` or `lstm`. |
-| `parameters` | Total parameter count. |
-| `parameters_receiving_gradient` | Parameters that received a gradient on the first backward pass. A gap against `parameters` is an allocated tensor the configured path never uses. |
-| `train_loss_nats` | Supervised cross entropy in nats, without the thinking weight. Same definition for the three models. |
-| `validation_loss_nats` | The same quantity measured on the validation split. |
-| `validation_bpb` | `validation_loss_nats / ln(2)`. One byte is one token on the byte path. |
-| `validation_tokens` | Supervised tokens in the validation pass. |
-| `train_tokens` | Supervised tokens processed in training, summed over every epoch. |
-| `elapsed_seconds` | Wall time of the training call, including validation that runs inside the epoch loop. |
-| `validation_seconds_inside_elapsed` | How much of `elapsed_seconds` was validation. |
-| `train_tokens_per_second` | `train_tokens / elapsed_seconds`. Identical to the including-validation field, kept so older numbers stay comparable. |
-| `train_tokens_per_second_including_validation` | Same ratio, named without ambiguity. |
-| `train_tokens_per_second_excluding_validation` | `train_tokens / (elapsed_seconds - validation_seconds_inside_elapsed)`. Use this one to compare models. |
-| `seed`, `epochs`, `optimizer_steps`, `batch_size`, `sequence_length` | Run configuration. |
-| `precision`, `device`, `ablation` | `fp32`, `bf16` or `fp16`; the PyTorch device; the ablation name, `none` for a baseline. |
-| `seeds_used` | Every seed behind the numbers. A single run reports one seed. |
-| `validation_bpb_std` | Sample standard deviation of per-seed `validation_bpb`. `null` for a single seed. |
-| `learning_rate_by_epoch` | Start and end learning rate of each epoch. |
-| `peak_memory_bytes`, `peak_memory_source` | CUDA allocator peak on a CUDA device, process peak working set otherwise. The source field says which. |
-| `flops_per_token_estimate` | `6 x parameters`. An approximation, not a measurement. |
-
-Two properties are enforced by tests rather than by convention. Only five
-fields carry text, each from a closed set, so a report cannot contain dataset
-content. And `aggregate_run_reports` refuses to merge runs that disagree on
-parameters, token counts, optimizer steps or configuration, which is what makes
-a multi-seed mean meaningful instead of a blend of different experiments.
-
-Multi-seed aggregation averages loss and time, then derives throughput from the
-averages. Total tokens over mean time keeps the report internally consistent; a
-mean of per-seed throughputs would not.
-
-The throughput split exists because the two code paths measure different
-windows. `benchmarks/run_benchmark.py` evaluates after training for every model,
-so `validation_seconds_inside_elapsed` is `0.0` there and the two throughput
-fields are equal. The `koemi train` path validates once per epoch inside the
-timed window, so its `elapsed_seconds` carries validation cost and the two
-fields differ. Comparing a number from one path against a number from the other
-without reading `validation_seconds_inside_elapsed` overstates the gap.
-
-`koemi train --report PATH` writes this schema and requires
-`--validation-fraction` above zero, because the schema has no valid value for a
-missing validation measurement.
-
-`benchmarks/run_benchmark.py` wraps each model as `{"report": ..., "diagnostics": ...}`.
-Architecture-specific numbers live in `diagnostics`: state bytes per sequence,
-per-token standard error, evaluation throughput and fixed-expert activation
-counts. `benchmarks/run_ablation.py` gives each ablation a `report` holding the
-multi-seed aggregate, plus `reports_by_seed` and `diagnostics_by_seed` so the
-standard deviation can be audited against the runs behind it.
-
 ## Historical Koemi-1FPA run
 
 Measured on 2026-09-11 with Python 3.13.14, PyTorch 2.14.0+cpu and four CPU
@@ -150,40 +90,6 @@ The epoch sweep also showed that HERM was not saturated at two epochs: the
 same seed moved from `6.319 bpb` at one epoch to `4.818 bpb` at four epochs.
 Comparing ablations before this budget would have measured convergence speed,
 not memory capacity.
-
-### Ablation schema verification, 2026-09-12
-
-This run existed to verify multi-seed aggregation, not to support a quality
-claim. Budget: `recall`, 256 training records, 512 evaluation records, two
-epochs, sequence 96, batch 32, `embedding_size=32`, seeds 17, 29 and 41. Every
-configuration evaluated the same 1,536 supervised bytes and took the same 16
-optimizer steps.
-
-| Configuration | Mean bpb | Seed std | Train tok/s | Parameters with gradient |
-| --- | ---: | ---: | ---: | ---: |
-| affine + head | 7.4275 | 0.0683 | 1,161.7 | 18,849 / 27,756 |
-| HERM without refine | 6.3904 | 0.0792 | 292.3 | 27,595 / 27,756 |
-| HERM without surprise | 6.3955 | 0.0748 | 197.5 | 27,724 / 27,756 |
-| HERM | 6.3881 | 0.0800 | 184.5 | 27,724 / 27,756 |
-
-The gradient column is what makes the ablations auditable. `affine` leaves 8,907
-parameters without a gradient, so it demonstrably skips the memory path.
-`no_refine` leaves 161, which is the refine gate plus the dead expert normalizer
-of KOEMI-009. `no_surprise` leaves the same 32 as the full path: surprise reuses
-the token predictor and owns no parameter of its own, so parameter count cannot
-detect it and throughput is the only available signal.
-
-Throughput says the refine path is the expensive half. Removing refine gives
-1.58x, removing surprise gives 1.07x, and the affine control runs 6.3x faster
-than the full path.
-
-Two epochs is below the saturation point established above, so these bpb values
-measure convergence speed more than memory capacity. What they do show is the
-same ordering as the four-epoch run: the affine control loses by roughly one bpb,
-and the three HERM variants sit inside each other's seed spread. The per-seed
-values are nearly identical across the three variants (seed 29 gives 6.3032,
-6.3068 and 6.3171), so the seed dominates and the ablation moves the third
-decimal.
 
 Commands:
 

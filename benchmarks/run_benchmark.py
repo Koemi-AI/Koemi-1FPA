@@ -21,24 +21,14 @@ sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 from koemi.configuration.settings import ModelSettings, PAD_TOKEN_ID, TrainingSettings
 from koemi.data.contracts import DatasetRecord
 from koemi.model.network import KoemiModel
-from koemi.observability.report import (
-    NATS_PER_BIT,
-    EpochLearningRate,
-    RunReport,
-    build_run_report,
-    render_json,
-)
-from koemi.observability.resources import measure_peak_memory
 from koemi.training.dataset import CausalByteDataset, IGNORE_TARGET_ID, create_training_loader
 from koemi.training.objective import token_cross_entropy
-from koemi.training.trainer import Trainer, count_parameters_with_gradient
+from koemi.training.trainer import Trainer
 
 MODEL_NAMES = ("koemi", "gru", "lstm")
 TASK_NAMES = ("bytes", "recall")
+NATS_PER_BIT = 0.6931471805599453
 VOCABULARY_SIZE = PAD_TOKEN_ID + 1
-BASELINE_PRECISION = "fp32"
-BASELINE_DEVICE = "cpu"
-BASELINE_ABLATION = "none"
 
 SUBJECTS = ("the queue", "the stack", "the buffer", "the cache", "the parser")
 VERBS = ("removes", "stores", "returns", "rejects", "accepts", "replaces")
@@ -47,34 +37,23 @@ REASONS = ("because arrival order decides", "because the window is small", "beca
 
 
 @dataclass(frozen=True)
-class RunDiagnostics:
+class BenchmarkReport:
+    model_name: str
     task_name: str
-    state_bytes_per_sequence: int
+    parameter_count: int
     parameter_bytes: int
-    validation_loss_standard_error_nats: float
-    validation_bpb_standard_error: float
-    validation_seconds_outside_elapsed: float
-    validation_tokens_per_second: float
-    expert_activation_counts: tuple[int, ...] | None
-
-
-@dataclass(frozen=True)
-class EvaluationOutcome:
-    loss_nats: float
-    elapsed_seconds: float
-    supervised_tokens: int
-    loss_standard_error_nats: float
-    expert_activation_counts: tuple[int, ...] | None
-
-
-@dataclass(frozen=True)
-class BaselineTrainingOutcome:
+    state_bytes_per_sequence: int
+    train_seconds: float
+    train_tokens_per_second: float
     train_loss_nats: float
-    elapsed_seconds: float
-    train_tokens: int
-    optimizer_steps: int
-    learning_rate_by_epoch: tuple[EpochLearningRate, ...]
-    parameters_receiving_gradient: int
+    evaluation_loss_nats: float
+    evaluation_supervised_tokens: int
+    evaluation_loss_standard_error_nats: float
+    bits_per_byte: float
+    bits_per_byte_standard_error: float
+    evaluation_tokens_per_second: float
+    peak_resident_bytes: int | None
+    expert_activation_counts: tuple[int, ...] | None
 
 
 class RecurrentBaseline(nn.Module):
@@ -94,6 +73,41 @@ class RecurrentBaseline(nn.Module):
     def state_bytes_per_sequence(self) -> int:
         state_tensors = 2 if self.cell_name == "lstm" else 1
         return state_tensors * self.hidden_size * 4
+
+
+def peak_resident_bytes() -> int | None:
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        class ProcessMemoryCounters(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD),
+                ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+            ]
+
+        counters = ProcessMemoryCounters()
+        counters.cb = ctypes.sizeof(counters)
+        current_process = ctypes.windll.kernel32.GetCurrentProcess
+        current_process.restype = wintypes.HANDLE
+        query_memory = ctypes.windll.psapi.GetProcessMemoryInfo
+        query_memory.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessMemoryCounters), wintypes.DWORD]
+        query_memory.restype = wintypes.BOOL
+        if not query_memory(current_process(), ctypes.byref(counters), counters.cb):
+            return None
+        return int(counters.PeakWorkingSetSize)
+    import resource
+
+    maximum_resident = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return int(maximum_resident) if sys.platform == "darwin" else int(maximum_resident) * 1024
 
 
 def build_byte_records(generator: random.Random, record_count: int, prefix: str) -> tuple[DatasetRecord, ...]:
@@ -164,7 +178,7 @@ def evaluation_error(values: list[float]) -> float:
     return float(values_tensor.std(unbiased=True) / len(values) ** 0.5)
 
 
-def evaluate_baseline(model: RecurrentBaseline, loader: DataLoader) -> EvaluationOutcome:
+def evaluate_baseline(model: RecurrentBaseline, loader: DataLoader) -> tuple[float, float, int, float]:
     model.eval()
     total_loss = 0.0
     total_tokens = 0
@@ -183,16 +197,10 @@ def evaluate_baseline(model: RecurrentBaseline, loader: DataLoader) -> Evaluatio
             token_losses.extend(token_loss.masked_select(supervised_mask).tolist())
             total_tokens += supervised_count
     elapsed_seconds = time.perf_counter() - start_time
-    return EvaluationOutcome(
-        loss_nats=total_loss / total_tokens,
-        elapsed_seconds=elapsed_seconds,
-        supervised_tokens=total_tokens,
-        loss_standard_error_nats=evaluation_error(token_losses),
-        expert_activation_counts=None,
-    )
+    return total_loss / total_tokens, elapsed_seconds, total_tokens, evaluation_error(token_losses)
 
 
-def evaluate_koemi(model: KoemiModel, loader: DataLoader) -> EvaluationOutcome:
+def evaluate_koemi(model: KoemiModel, loader: DataLoader) -> tuple[float, float, int, float, tuple[int, ...]]:
     model.eval()
     total_loss = 0.0
     total_tokens = 0
@@ -217,28 +225,16 @@ def evaluate_koemi(model: KoemiModel, loader: DataLoader) -> EvaluationOutcome:
             for index, count in enumerate(counts):
                 activation_counts[index] += count
     elapsed_seconds = time.perf_counter() - start_time
-    return EvaluationOutcome(
-        loss_nats=total_loss / total_tokens,
-        elapsed_seconds=elapsed_seconds,
-        supervised_tokens=total_tokens,
-        loss_standard_error_nats=evaluation_error(token_losses),
-        expert_activation_counts=tuple(activation_counts),
-    )
+    return total_loss / total_tokens, elapsed_seconds, total_tokens, evaluation_error(token_losses), tuple(activation_counts)
 
 
-def train_baseline(
-    model: RecurrentBaseline, loader: DataLoader, arguments: argparse.Namespace
-) -> BaselineTrainingOutcome:
+def train_baseline(model: RecurrentBaseline, loader: DataLoader, arguments: argparse.Namespace) -> tuple[float, float, int]:
     optimizer = torch.optim.AdamW(model.parameters(), lr=arguments.learning_rate)
     model.train()
     weighted_loss = 0.0
     supervised_total = 0
-    optimizer_steps = 0
-    parameters_receiving_gradient = 0
-    learning_rate_by_epoch: list[EpochLearningRate] = []
     start_time = time.perf_counter()
-    for epoch_index in range(1, arguments.epochs + 1):
-        learning_rate_at_epoch_start = optimizer.param_groups[0]["lr"]
+    for _ in range(arguments.epochs):
         for batch in loader:
             target_ids = batch["target_ids"]
             supervised_mask = target_ids != IGNORE_TARGET_ID
@@ -253,128 +249,15 @@ def train_baseline(
                 ignore_index=IGNORE_TARGET_ID,
             )
             loss.backward()
-            if parameters_receiving_gradient == 0:
-                parameters_receiving_gradient = count_parameters_with_gradient(model)
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            optimizer_steps += 1
             weighted_loss += float(loss.detach()) * supervised_count
             supervised_total += supervised_count
-        learning_rate_by_epoch.append(
-            EpochLearningRate(
-                epoch=epoch_index,
-                learning_rate_start=learning_rate_at_epoch_start,
-                learning_rate_end=optimizer.param_groups[0]["lr"],
-            )
-        )
     elapsed_seconds = time.perf_counter() - start_time
-    return BaselineTrainingOutcome(
-        train_loss_nats=weighted_loss / supervised_total,
-        elapsed_seconds=elapsed_seconds,
-        train_tokens=supervised_total,
-        optimizer_steps=optimizer_steps,
-        learning_rate_by_epoch=tuple(learning_rate_by_epoch),
-        parameters_receiving_gradient=parameters_receiving_gradient,
-    )
+    return weighted_loss / supervised_total, elapsed_seconds, supervised_total
 
 
-def build_diagnostics(
-    arguments: argparse.Namespace,
-    state_bytes_per_sequence: int,
-    parameter_bytes: int,
-    evaluation: EvaluationOutcome,
-) -> RunDiagnostics:
-    return RunDiagnostics(
-        task_name=arguments.task,
-        state_bytes_per_sequence=state_bytes_per_sequence,
-        parameter_bytes=parameter_bytes,
-        validation_loss_standard_error_nats=evaluation.loss_standard_error_nats,
-        validation_bpb_standard_error=evaluation.loss_standard_error_nats / NATS_PER_BIT,
-        validation_seconds_outside_elapsed=evaluation.elapsed_seconds,
-        validation_tokens_per_second=evaluation.supervised_tokens / evaluation.elapsed_seconds,
-        expert_activation_counts=evaluation.expert_activation_counts,
-    )
-
-
-def run_koemi(arguments: argparse.Namespace, model_settings: ModelSettings, loaders: tuple[DataLoader, DataLoader]) -> tuple[RunReport, RunDiagnostics]:
-    train_loader, evaluation_loader = loaders
-    torch.manual_seed(arguments.seed)
-    model = KoemiModel(model_settings)
-    parameter_count, parameter_bytes = count_parameter_bytes(model)
-    training_settings = TrainingSettings(
-        sequence_length=arguments.sequence_length,
-        batch_size=arguments.batch_size,
-        epochs=arguments.epochs,
-        learning_rate=arguments.learning_rate,
-        device=BASELINE_DEVICE,
-    )
-    logger = logging.getLogger("koemi-benchmark")
-    logger.addHandler(logging.NullHandler())
-    training = Trainer(logger).train(model, train_loader, training_settings)
-    evaluation = evaluate_koemi(model, evaluation_loader)
-    peak_memory_bytes, peak_memory_source = measure_peak_memory(training.device)
-    report = build_run_report(
-        model="koemi",
-        parameters=parameter_count,
-        parameters_receiving_gradient=training.parameters_receiving_gradient,
-        train_loss_nats=training.mean_task_loss,
-        validation_loss_nats=evaluation.loss_nats,
-        validation_tokens=evaluation.supervised_tokens,
-        train_tokens=training.supervised_token_count,
-        elapsed_seconds=training.elapsed_seconds,
-        validation_seconds_inside_elapsed=training.validation_seconds_inside_elapsed,
-        seed=arguments.seed,
-        epochs=arguments.epochs,
-        optimizer_steps=training.optimizer_steps,
-        batch_size=arguments.batch_size,
-        sequence_length=arguments.sequence_length,
-        precision=training.precision,
-        device=training.device,
-        ablation=arguments.ablation,
-        learning_rate_by_epoch=training.learning_rate_by_epoch,
-        peak_memory_bytes=peak_memory_bytes,
-        peak_memory_source=peak_memory_source,
-    )
-    diagnostics = build_diagnostics(arguments, koemi_state_bytes(model_settings), parameter_bytes, evaluation)
-    return report, diagnostics
-
-
-def run_baseline(arguments: argparse.Namespace, target_parameter_count: int, loaders: tuple[DataLoader, DataLoader]) -> tuple[RunReport, RunDiagnostics]:
-    train_loader, evaluation_loader = loaders
-    hidden_size = match_hidden_size(arguments.model, arguments.embedding_size, target_parameter_count)
-    torch.manual_seed(arguments.seed)
-    baseline = RecurrentBaseline(arguments.model, arguments.embedding_size, hidden_size)
-    parameter_count, parameter_bytes = count_parameter_bytes(baseline)
-    training = train_baseline(baseline, train_loader, arguments)
-    evaluation = evaluate_baseline(baseline, evaluation_loader)
-    peak_memory_bytes, peak_memory_source = measure_peak_memory(BASELINE_DEVICE)
-    report = build_run_report(
-        model=arguments.model,
-        parameters=parameter_count,
-        parameters_receiving_gradient=training.parameters_receiving_gradient,
-        train_loss_nats=training.train_loss_nats,
-        validation_loss_nats=evaluation.loss_nats,
-        validation_tokens=evaluation.supervised_tokens,
-        train_tokens=training.train_tokens,
-        elapsed_seconds=training.elapsed_seconds,
-        validation_seconds_inside_elapsed=0.0,
-        seed=arguments.seed,
-        epochs=arguments.epochs,
-        optimizer_steps=training.optimizer_steps,
-        batch_size=arguments.batch_size,
-        sequence_length=arguments.sequence_length,
-        precision=BASELINE_PRECISION,
-        device=BASELINE_DEVICE,
-        ablation=BASELINE_ABLATION,
-        learning_rate_by_epoch=training.learning_rate_by_epoch,
-        peak_memory_bytes=peak_memory_bytes,
-        peak_memory_source=peak_memory_source,
-    )
-    diagnostics = build_diagnostics(arguments, baseline.state_bytes_per_sequence(), parameter_bytes, evaluation)
-    return report, diagnostics
-
-
-def run_single_model(arguments: argparse.Namespace) -> dict:
+def run_single_model(arguments: argparse.Namespace) -> BenchmarkReport:
     torch.manual_seed(arguments.seed)
     generator = random.Random(arguments.seed)
     train_records = build_records(arguments.task, generator, arguments.train_records, "train")
@@ -392,17 +275,67 @@ def run_single_model(arguments: argparse.Namespace) -> dict:
         expert_count=arguments.expert_count,
         ablation=arguments.ablation,
     )
-    loaders = (train_loader, evaluation_loader)
+    koemi_parameter_count, koemi_parameter_bytes = count_parameter_bytes(KoemiModel(model_settings))
+    torch.manual_seed(arguments.seed)
     if arguments.model == "koemi":
-        report, diagnostics = run_koemi(arguments, model_settings, loaders)
-    else:
-        koemi_parameter_count, _ = count_parameter_bytes(KoemiModel(model_settings))
-        report, diagnostics = run_baseline(arguments, koemi_parameter_count, loaders)
-    return {"report": report.to_dict(), "diagnostics": asdict(diagnostics)}
+        model = KoemiModel(model_settings)
+        training_settings = TrainingSettings(
+            sequence_length=arguments.sequence_length,
+            batch_size=arguments.batch_size,
+            epochs=arguments.epochs,
+            learning_rate=arguments.learning_rate,
+            device="cpu",
+        )
+        logger = logging.getLogger("koemi-benchmark")
+        logger.addHandler(logging.NullHandler())
+        result = Trainer(logger).train(model, train_loader, training_settings)
+        loss, evaluation_seconds, evaluation_tokens, loss_standard_error, activations = evaluate_koemi(model, evaluation_loader)
+        return BenchmarkReport(
+            model_name="koemi",
+            task_name=arguments.task,
+            parameter_count=koemi_parameter_count,
+            parameter_bytes=koemi_parameter_bytes,
+            state_bytes_per_sequence=koemi_state_bytes(model_settings),
+            train_seconds=result.elapsed_seconds,
+            train_tokens_per_second=result.supervised_token_count / result.elapsed_seconds,
+            train_loss_nats=result.mean_loss,
+            evaluation_loss_nats=loss,
+            evaluation_supervised_tokens=evaluation_tokens,
+            evaluation_loss_standard_error_nats=loss_standard_error,
+            bits_per_byte=loss / NATS_PER_BIT,
+            bits_per_byte_standard_error=loss_standard_error / NATS_PER_BIT,
+            evaluation_tokens_per_second=evaluation_tokens / evaluation_seconds,
+            peak_resident_bytes=peak_resident_bytes(),
+            expert_activation_counts=activations,
+        )
+    hidden_size = match_hidden_size(arguments.model, arguments.embedding_size, koemi_parameter_count)
+    torch.manual_seed(arguments.seed)
+    baseline = RecurrentBaseline(arguments.model, arguments.embedding_size, hidden_size)
+    parameter_count, parameter_bytes = count_parameter_bytes(baseline)
+    train_loss, train_seconds, train_tokens = train_baseline(baseline, train_loader, arguments)
+    loss, evaluation_seconds, evaluation_tokens, loss_standard_error = evaluate_baseline(baseline, evaluation_loader)
+    return BenchmarkReport(
+        model_name=arguments.model,
+        task_name=arguments.task,
+        parameter_count=parameter_count,
+        parameter_bytes=parameter_bytes,
+        state_bytes_per_sequence=baseline.state_bytes_per_sequence(),
+        train_seconds=train_seconds,
+        train_tokens_per_second=train_tokens / train_seconds,
+        train_loss_nats=train_loss,
+        evaluation_loss_nats=loss,
+        evaluation_supervised_tokens=evaluation_tokens,
+        evaluation_loss_standard_error_nats=loss_standard_error,
+        bits_per_byte=loss / NATS_PER_BIT,
+        bits_per_byte_standard_error=loss_standard_error / NATS_PER_BIT,
+        evaluation_tokens_per_second=evaluation_tokens / evaluation_seconds,
+        peak_resident_bytes=peak_resident_bytes(),
+        expert_activation_counts=None,
+    )
 
 
 def run_every_model(arguments: argparse.Namespace) -> list[dict]:
-    payloads = []
+    reports = []
     for model_name in MODEL_NAMES:
         command = [sys.executable, str(Path(__file__).resolve()), "--model", model_name]
         for key, value in vars(arguments).items():
@@ -412,8 +345,8 @@ def run_every_model(arguments: argparse.Namespace) -> list[dict]:
         completed = subprocess.run(command, capture_output=True, text=True, check=False)
         if completed.returncode != 0:
             raise RuntimeError(f"benchmark for {model_name} failed: {completed.stderr.strip()}")
-        payloads.append(json.loads(completed.stdout))
-    return payloads
+        reports.append(json.loads(completed.stdout))
+    return reports
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -439,7 +372,7 @@ def create_parser() -> argparse.ArgumentParser:
 def main(argument_values: list[str] | None = None) -> int:
     arguments = create_parser().parse_args(argument_values)
     if arguments.model is not None:
-        print(render_json(run_single_model(arguments)))
+        print(json.dumps(asdict(run_single_model(arguments)), indent=2, sort_keys=True))
         return 0
     payload = {
         "architecture": "Koemi-2OBOV",
@@ -447,9 +380,9 @@ def main(argument_values: list[str] | None = None) -> int:
         "seed": arguments.seed,
         "platform": sys.platform,
         "torch_version": torch.__version__,
-        "runs": run_every_model(arguments),
+        "reports": run_every_model(arguments),
     }
-    rendered = render_json(payload)
+    rendered = json.dumps(payload, indent=2, sort_keys=True)
     if arguments.report:
         Path(arguments.report).write_text(rendered, encoding="utf-8")
     print(rendered)
