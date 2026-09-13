@@ -8,7 +8,7 @@ from typing import Sequence
 
 import torch
 
-from koemi.configuration.settings import DEFAULT_DATA_SEED, ModelSettings, TrainingSettings
+from koemi.configuration.settings import ModelSettings, TrainingSettings
 from koemi.data.adapters import SUPPORTED_DATASET_FORMATS
 from koemi.data.readers import DatasetLoadReport, load_dataset_records, split_dataset_records
 from koemi.data.tokenizer import ByteTokenizer
@@ -68,7 +68,6 @@ def create_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--label-smoothing", type=float, default=0.0)
     train_parser.add_argument("--validation-fraction", type=float, default=0.0)
     train_parser.add_argument("--seed", type=int, default=17)
-    train_parser.add_argument("--data-seed", type=int, default=DEFAULT_DATA_SEED)
     train_parser.add_argument("--num-workers", type=int, default=0)
     train_parser.add_argument("--prefetch-factor", type=int, default=2)
     train_parser.add_argument("--no-pin-memory", action="store_true")
@@ -141,13 +140,13 @@ def train_model(arguments: argparse.Namespace, logger) -> int:
     )
     effective_pin_memory = training_settings.pin_memory and training_settings.device.startswith("cuda")
     training_records, validation_records = split_dataset_records(
-        report.records, arguments.validation_fraction, arguments.data_seed
+        report.records, arguments.validation_fraction, arguments.seed
     )
     dataset = CausalByteDataset(training_records, training_settings.sequence_length)
     loader = create_training_loader(
         dataset,
         training_settings.batch_size,
-        torch.Generator().manual_seed(arguments.data_seed),
+        torch.Generator().manual_seed(arguments.seed),
         num_workers=training_settings.num_workers,
         pin_memory=effective_pin_memory,
         prefetch_factor=training_settings.prefetch_factor,
@@ -165,7 +164,6 @@ def train_model(arguments: argparse.Namespace, logger) -> int:
         )
     if arguments.report and validation_loader is None:
         raise ValueError("--report requires a validation split, so --validation-fraction must be above zero")
-    torch.manual_seed(arguments.seed)
     model = KoemiModel(model_settings)
     result = Trainer(logger).train(model, loader, training_settings, validation_loader)
     checkpoint_path = CheckpointStore().save(arguments.checkpoint, model, overwrite=arguments.overwrite)
@@ -208,7 +206,6 @@ def write_run_report(arguments: argparse.Namespace, model: KoemiModel, result: T
         elapsed_seconds=result.elapsed_seconds,
         validation_seconds_inside_elapsed=result.validation_seconds_inside_elapsed,
         seed=arguments.seed,
-        data_seed=arguments.data_seed,
         epochs=arguments.epochs,
         optimizer_steps=result.optimizer_steps,
         batch_size=arguments.batch_size,

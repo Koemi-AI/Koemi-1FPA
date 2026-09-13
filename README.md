@@ -165,8 +165,6 @@ more finely than byte-only dispatch, but it is not learned semantic routing.
 | `--thinking-loss-weight` | `1.0` | Relative weight of supervised thinking bytes. |
 | `--gradient-accumulation-steps` | `1` | Microbatches per optimizer update. |
 | `--precision` | `auto` | FP32 on CPU; BF16 or FP16 AMP on supported CUDA. |
-| `--seed` | `17` | Weight initialization and stochastic training seed. |
-| `--data-seed` | `0` | Synthetic data, validation split and loader shuffle seed. |
 | `--validation-fraction` | `0.0` | Deterministic record-level holdout fraction. |
 | `--num-workers` | `0` | DataLoader worker processes. |
 | `--ablation` | `herm` | `herm`, `no_refine`, `no_surprise` or `affine` control. |

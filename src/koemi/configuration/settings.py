@@ -8,7 +8,6 @@ import torch
 
 BYTE_VOCABULARY_SIZE = 256
 PAD_TOKEN_ID = BYTE_VOCABULARY_SIZE
-DEFAULT_DATA_SEED = 0
 
 
 @dataclass(frozen=True)
