@@ -21,8 +21,6 @@ def run_one(
     task: str,
     seed: int,
     data_seed: int,
-    device: str,
-    precision: str,
     train_records: int,
     evaluation_records: int,
     sequence_length: int,
@@ -44,10 +42,6 @@ def run_one(
         str(seed),
         "--data-seed",
         str(data_seed),
-        "--device",
-        device,
-        "--precision",
-        precision,
         "--train-records",
         str(train_records),
         "--evaluation-records",
@@ -87,8 +81,6 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--task", choices=("bytes", "recall"), default="recall")
     parser.add_argument("--seeds", type=int, nargs="+", default=(17, 29, 41))
     parser.add_argument("--data-seed", type=int, default=DEFAULT_DATA_SEED)
-    parser.add_argument("--device", default="auto")
-    parser.add_argument("--precision", choices=("auto", "fp32", "fp16", "bf16"), default="auto")
     parser.add_argument("--train-records", type=int, default=16)
     parser.add_argument("--evaluation-records", type=int, default=1024)
     parser.add_argument("--sequence-length", type=int, default=96)
@@ -114,8 +106,6 @@ def main(argument_values: list[str] | None = None) -> int:
                 arguments.task,
                 seed,
                 arguments.data_seed,
-                arguments.device,
-                arguments.precision,
                 arguments.train_records,
                 arguments.evaluation_records,
                 arguments.sequence_length,
