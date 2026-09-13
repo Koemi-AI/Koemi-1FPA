@@ -27,8 +27,7 @@ On Windows, replace `.venv/bin/python` with `.venv\Scripts\python`.
 
 ## Dataset contract
 
-The loader accepts UTF-8 `.txt`, `.json` arrays, `.jsonl` files, directories of
-`.txt` documents, and local Parquet/Arrow tables. A normalized record uses
+The loader accepts UTF-8 `.txt`, `.json` arrays and `.jsonl` files. A normalized record uses
 this shape:
 
 ```json
@@ -47,21 +46,6 @@ thinking text is an internal reasoning trace.
 
 For plain text, set `output` to `null`; the complete `input` becomes the causal
 training sequence. Alpaca and ShareGPT records enter through validated adapters.
-
-Named Hugging Face datasets and Parquet/Arrow inputs require the optional
-reader dependency:
-
-```bash
-python -m pip install -e '.[datasets]'
-python -m koemi inspect-dataset \
-  --dataset-name Salesforce/wikitext \
-  --dataset-config wikitext-2-raw-v1 \
-  --dataset-split train \
-  --text-field text
-```
-
-Use `--text-field` to select the string column in tabular or Hugging Face
-datasets. Missing, non-string, and empty fields fail explicitly.
 
 ```bash
 .venv/bin/python -m koemi inspect-dataset --dataset examples/canonical.jsonl

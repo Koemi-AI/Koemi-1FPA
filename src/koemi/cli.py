@@ -92,13 +92,8 @@ def create_parser() -> argparse.ArgumentParser:
 
 
 def add_dataset_arguments(parser: argparse.ArgumentParser) -> None:
-    dataset_group = parser.add_mutually_exclusive_group(required=True)
-    dataset_group.add_argument("--dataset", action="append", help="JSON, JSONL, TXT, Parquet or Arrow dataset path")
-    dataset_group.add_argument("--dataset-name", help="Hugging Face dataset name, for example Salesforce/wikitext")
+    parser.add_argument("--dataset", action="append", required=True, help="JSON, JSONL or TXT dataset path")
     parser.add_argument("--dataset-format", choices=SUPPORTED_DATASET_FORMATS, default="auto")
-    parser.add_argument("--dataset-config", default=None, help="Optional Hugging Face dataset configuration")
-    parser.add_argument("--dataset-split", default="train", help="Hugging Face split to load")
-    parser.add_argument("--text-field", default="text", help="Text field for Hugging Face, Parquet and Arrow rows")
 
 
 def add_model_arguments(parser: argparse.ArgumentParser) -> None:
@@ -113,20 +108,18 @@ def add_model_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def inspect_dataset(arguments: argparse.Namespace, logger) -> int:
-    report = load_and_log_dataset(arguments, logger)
+    report = load_and_log_dataset(arguments.dataset, arguments.dataset_format, logger)
     report_payload = {
         "adapter_counts": report.adapter_counts,
         "record_count": report.record_count,
         "source_files": [str(source_file) for source_file in report.source_files],
-        "dataset_name": arguments.dataset_name,
-        "dataset_split": arguments.dataset_split if arguments.dataset_name else None,
     }
     write_utf8(json.dumps(report_payload, indent=2, sort_keys=True))
     return 0
 
 
 def train_model(arguments: argparse.Namespace, logger) -> int:
-    report = load_and_log_dataset(arguments, logger)
+    report = load_and_log_dataset(arguments.dataset, arguments.dataset_format, logger)
     model_settings = create_model_settings(arguments)
     training_settings = TrainingSettings(
         sequence_length=arguments.sequence_length,
@@ -278,15 +271,8 @@ def generate_completion(arguments: argparse.Namespace, logger) -> int:
     return 0
 
 
-def load_and_log_dataset(arguments: argparse.Namespace, logger) -> DatasetLoadReport:
-    report = load_dataset_records(
-        arguments.dataset or (),
-        arguments.dataset_format,
-        dataset_name=arguments.dataset_name,
-        dataset_config=arguments.dataset_config,
-        text_field=arguments.text_field,
-        dataset_split=arguments.dataset_split,
-    )
+def load_and_log_dataset(dataset_paths: list[str], dataset_format: str, logger) -> DatasetLoadReport:
+    report = load_dataset_records(dataset_paths, dataset_format)
     logger.info(
         "dataset_loaded records=%s adapters=%s source_files=%s",
         report.record_count,

@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 import json
-import builtins
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 from koemi.data.contracts import DatasetValidationError
 from koemi.data.readers import load_dataset_records, split_dataset_records
@@ -72,46 +70,6 @@ class DatasetReaderTests(unittest.TestCase):
         self.assertEqual({"text": 1, "canonical": 1}, report.adapter_counts)
         self.assertEqual(first_split, second_split)
         self.assertEqual((1, 1), tuple(len(part) for part in first_split))
-
-    def test_loads_each_txt_file_from_a_directory(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            directory = Path(temporary_directory)
-            (directory / "02.txt").write_text("second document", encoding="utf-8")
-            (directory / "01.txt").write_text("first document", encoding="utf-8")
-            (directory / "ignored.json").write_text("[]", encoding="utf-8")
-            report = load_dataset_records([directory])
-        self.assertEqual(2, report.record_count)
-        self.assertEqual(["01", "02"], [record.identifier for record in report.records])
-        self.assertEqual({"text": 2}, report.adapter_counts)
-
-    def test_tabular_rows_use_a_configured_text_field(self) -> None:
-        from koemi.data.readers import record_from_text_field
-
-        record = record_from_text_field(
-            {"body": "A document", "source": "fixture"}, "body", "row-1", "fixture.parquet", 1
-        )
-        self.assertEqual("A document", record.input_text)
-        self.assertEqual({"source": "fixture"}, record.metadata)
-
-    def test_tabular_rows_reject_missing_or_non_string_text_field(self) -> None:
-        from koemi.data.readers import record_from_text_field
-
-        with self.assertRaisesRegex(DatasetValidationError, "missing text field 'body'"):
-            record_from_text_field({"text": "wrong"}, "body", "row-1", "fixture.arrow", 1)
-        with self.assertRaisesRegex(DatasetValidationError, "field 'body' must be a string"):
-            record_from_text_field({"body": 7}, "body", "row-1", "fixture.arrow", 1)
-
-    def test_named_dataset_requires_optional_datasets_dependency(self) -> None:
-        real_import = builtins.__import__
-
-        def import_without_datasets(name, *args, **kwargs):
-            if name == "datasets":
-                raise ImportError("datasets unavailable for test")
-            return real_import(name, *args, **kwargs)
-
-        with patch("builtins.__import__", side_effect=import_without_datasets):
-            with self.assertRaisesRegex(RuntimeError, "optional 'datasets' package"):
-                load_dataset_records(dataset_name="fixture/missing", text_field="text")
 
     def test_validation_split_rejects_a_single_record(self) -> None:
         with self.temporary_json_file([{"id": "one", "input": "text", "output": None}]) as dataset_path:

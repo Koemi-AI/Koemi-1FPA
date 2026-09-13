@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from koemi.cli import create_parser, main, write_utf8
+from koemi.cli import main, write_utf8
 from koemi.observability.report import RunReport
 
 
@@ -30,20 +30,6 @@ class CliOutputTests(unittest.TestCase):
 
 
 class CliCommandTests(unittest.TestCase):
-    def test_dataset_name_and_text_field_are_cli_options(self) -> None:
-        arguments = create_parser().parse_args(
-            ["inspect-dataset", "--dataset-name", "fixture/corpus", "--text-field", "body", "--dataset-split", "validation"]
-        )
-        self.assertEqual("fixture/corpus", arguments.dataset_name)
-        self.assertEqual("body", arguments.text_field)
-        self.assertEqual("validation", arguments.dataset_split)
-
-    def test_dataset_path_and_dataset_name_are_mutually_exclusive(self) -> None:
-        with self.assertRaises(SystemExit):
-            create_parser().parse_args(
-                ["inspect-dataset", "--dataset", "records.json", "--dataset-name", "fixture/corpus"]
-            )
-
     def test_trains_and_generates_with_obov_flags(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             workspace = Path(temporary_directory)

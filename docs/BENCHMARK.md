@@ -1,20 +1,5 @@
 # Koemi benchmark ledger
 
-## Dataset inputs
-
-The CLI accepts one or more JSON/JSONL files, a directory containing `.txt`
-documents, and local Parquet/Arrow files. Tabular and named Hugging Face
-datasets use `--text-field` (default: `text`). Named datasets select a split
-with `--dataset-split` and require the optional dependency:
-
-```powershell
-pip install "koemi[datasets]"
-koemi inspect-dataset --dataset-name Salesforce/wikitext --dataset-config wikitext-2-raw-v1 --dataset-split train --text-field text
-```
-
-Rows with a missing, non-string, or empty configured text field fail with a
-`DatasetValidationError`; they are never silently discarded.
-
 This file separates historical Koemi-1FPA measurements from Koemi-2OBOV
 measurements. The old numbers must not be quoted as OBOV results.
 
