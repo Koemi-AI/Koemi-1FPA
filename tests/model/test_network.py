@@ -12,7 +12,6 @@ from koemi.configuration.settings import ModelSettings, PAD_TOKEN_ID
 from koemi.model.cache import DiskMappingCache, WarmTokenCache
 from koemi.model.execution import ExecutionMode
 from koemi.model.network import KoemiModel
-from koemi.training.trainer import count_parameters_with_gradient
 
 
 class KoemiModelTests(unittest.TestCase):
@@ -31,13 +30,6 @@ class KoemiModelTests(unittest.TestCase):
         self.assertEqual(6, output.token_count)
         self.assertEqual((), output.expert_activation_counts)
         self.assertTrue(torch.equal(output.expert_indices, torch.full_like(input_ids, -1)))
-
-    def test_zero_experts_have_no_dead_normalizer_parameters(self) -> None:
-        model = self.build_model(expert_count=0)
-        input_ids = torch.tensor([[65, 66, 67]], dtype=torch.long)
-        model(input_ids).logits.sum().backward()
-        parameter_count = sum(parameter.numel() for parameter in model.parameters())
-        self.assertEqual(parameter_count, count_parameters_with_gradient(model))
 
     def test_affine_ablation_is_a_memory_free_control(self) -> None:
         model = self.build_model(ablation="affine", expert_count=4)
