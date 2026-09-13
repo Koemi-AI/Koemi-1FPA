@@ -136,7 +136,7 @@ def count_parameter_bytes(model: nn.Module) -> tuple[int, int]:
 def match_hidden_size(cell_name: str, embedding_size: int, target_parameter_count: int) -> int:
     best_hidden_size = 8
     best_distance = None
-    for hidden_size in range(8, 513):
+    for hidden_size in range(8, 513, 4):
         candidate = RecurrentBaseline(cell_name, embedding_size, hidden_size)
         parameter_count, _ = count_parameter_bytes(candidate)
         distance = abs(parameter_count - target_parameter_count)

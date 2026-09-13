@@ -178,7 +178,6 @@ more finely than byte-only dispatch, but it is not learned semantic routing.
 ```bash
 .venv/bin/python benchmarks/run_benchmark.py --task bytes --report artifacts/bench-bytes-obov.json
 .venv/bin/python benchmarks/run_benchmark.py --task recall --report artifacts/bench-recall-obov.json
-.venv/bin/python benchmarks/run_wikitext.py --report artifacts/bench-wikitext2.json --device auto --precision auto
 .venv/bin/python benchmarks/run_ablation.py --task recall --seeds 17 29 41 --train-records 1024 --evaluation-records 1024 --epochs 4 --report artifacts/ablation-recall.json
 ```
 

@@ -71,12 +71,6 @@ dynamic shapes. Compilation is not a performance result until warmup and the
 compiled execution are measured separately. On Windows, Inductor may require
 the MSVC C++ compiler (`cl`) even for a CPU smoke run.
 
-`benchmarks/run_wikitext.py` downloads `Salesforce/wikitext` with the
-`wikitext-2-raw-v1` configuration, uses the official train and validation
-splits, and groups rows by article heading before chunking. It emits the same
-`report` and `diagnostics` objects for Koemi, GRU and LSTM. Install the optional
-`datasets` package before running it.
-
 ## Historical Koemi-1FPA run
 
 Measured on 2026-09-11 with Python 3.13.14, PyTorch 2.14.0+cpu and four CPU
