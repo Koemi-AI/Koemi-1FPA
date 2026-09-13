@@ -10,7 +10,7 @@ from torch.nn import functional
 from koemi.configuration.settings import ModelSettings, PAD_TOKEN_ID
 from koemi.model.cache import CachedMapping, DiskMappingCache, WarmTokenCache
 from koemi.model.execution import ExecutionMode
-from koemi.model.experts import ExpertMixture
+from koemi.model.experts import DeterministicExpertMixture
 from koemi.model.layers import RootMeanSquareNorm
 from koemi.model.memory import (
     BoundedRecurrentState,
@@ -33,7 +33,6 @@ class KoemiOutput:
     cache_hits: int
     cache_misses: int
     expert_count: int
-    router_loss: Tensor
 
     @property
     def expert_activation_counts(self) -> tuple[int, ...]:
@@ -60,14 +59,7 @@ class KoemiModel(nn.Module):
         self.memory_refine_gate = nn.Linear(embedding_size * 4, 1)
         self.fusion_projection = nn.Linear(embedding_size * 3, embedding_size)
         self.fusion_normalizer = RootMeanSquareNorm(embedding_size)
-        self.experts = ExpertMixture(
-            embedding_size,
-            settings.expert_count,
-            routing=settings.expert_routing,
-            top_k=settings.expert_top_k,
-            hidden_multiplier=settings.expert_hidden_multiplier,
-            router_jitter=settings.expert_router_jitter,
-        )
+        self.experts = DeterministicExpertMixture(embedding_size, settings.expert_count)
         self.token_predictor = nn.Linear(embedding_size, settings.vocabulary_size)
 
     def forward(
@@ -221,14 +213,14 @@ class KoemiModel(nn.Module):
             current_state.step_index + length,
             device=input_ids.device,
         ).unsqueeze(0).expand_as(input_ids)
-        expert_output = self.experts(
+        final_context, expert_indices = self.experts(
             fused_context,
             input_ids,
             previous_token_ids,
             positions,
             valid_mask,
         )
-        logits = self.predict_tokens(expert_output.context)
+        logits = self.predict_tokens(final_context)
         next_local_keys, next_local_values, next_local_valid = self.local_memory.tail(
             current_state.local_keys,
             current_state.local_values,
@@ -253,13 +245,12 @@ class KoemiModel(nn.Module):
             logits=logits,
             state=next_state,
             surprise_values=surprise,
-            expert_indices=expert_output.assignment,
+            expert_indices=expert_indices,
             valid_positions=valid_mask,
             token_count=int(valid_mask.sum()),
             cache_hits=cache_hits,
             cache_misses=cache_misses,
             expert_count=self.settings.expert_count,
-            router_loss=expert_output.load_balance,
         )
 
     def forward_affine_window(
@@ -283,9 +274,8 @@ class KoemiModel(nn.Module):
             last_token_ids=self.last_valid_token_ids(input_ids, valid_mask, current_state.last_token_ids),
             step_index=current_state.step_index + input_ids.shape[1],
         )
-        logits = self.predict_tokens(working_states)
         return KoemiOutput(
-            logits=logits,
+            logits=self.predict_tokens(working_states),
             state=next_state,
             surprise_values=torch.zeros_like(working_states[..., 0]),
             expert_indices=torch.full_like(input_ids, -1),
@@ -294,7 +284,6 @@ class KoemiModel(nn.Module):
             cache_hits=cache_hits,
             cache_misses=cache_misses,
             expert_count=0,
-            router_loss=logits.new_zeros(()),
         )
 
     def forward_sequential(
@@ -309,7 +298,6 @@ class KoemiModel(nn.Module):
         surprise_by_position: list[Tensor] = []
         expert_indices_by_position: list[Tensor] = []
         valid_by_position: list[Tensor] = []
-        load_balance_by_position: list[Tensor] = []
         cache_hits = 0
         cache_misses = 0
         for position in range(length):
@@ -377,17 +365,16 @@ class KoemiModel(nn.Module):
             )
             fused_context = self.fuse(working_state, memory_value, local_value)
             positions = torch.full_like(token_ids, current_state.step_index)
-            expert_output = self.experts(
+            final_context, expert_indices = self.experts(
                 fused_context.unsqueeze(1),
                 token_ids.unsqueeze(1),
                 current_state.last_token_ids.unsqueeze(1),
                 positions.unsqueeze(1),
                 valid_mask.unsqueeze(1),
             )
-            load_balance_by_position.append(expert_output.load_balance)
-            logits_by_position.append(self.predict_tokens(expert_output.context[:, 0]))
+            logits_by_position.append(self.predict_tokens(final_context[:, 0]))
             surprise_by_position.append(surprise)
-            expert_indices_by_position.append(expert_output.assignment[:, 0])
+            expert_indices_by_position.append(expert_indices[:, 0])
             valid_by_position.append(valid_mask)
 
             fast_terms = self.associative_memory.fast_write_terms(projection, surprise)
@@ -452,9 +439,8 @@ class KoemiModel(nn.Module):
             )
         valid_positions = torch.stack(valid_by_position, dim=1)
         expert_indices = torch.stack(expert_indices_by_position, dim=1)
-        logits = torch.stack(logits_by_position, dim=1)
         return KoemiOutput(
-            logits=logits,
+            logits=torch.stack(logits_by_position, dim=1),
             state=current_state,
             surprise_values=torch.stack(surprise_by_position, dim=1),
             expert_indices=expert_indices,
@@ -463,11 +449,6 @@ class KoemiModel(nn.Module):
             cache_hits=cache_hits,
             cache_misses=cache_misses,
             expert_count=self.settings.expert_count,
-            router_loss=(
-                torch.stack(load_balance_by_position).mean()
-                if load_balance_by_position
-                else logits.new_zeros(())
-            ),
         )
 
     def calculate_surprise(self, prior_states: Tensor, input_ids: Tensor, valid_mask: Tensor) -> Tensor:
@@ -568,9 +549,8 @@ class KoemiModel(nn.Module):
             last_token_ids=mapping.state.last_token_ids.to(device),
             step_index=mapping.state.step_index,
         )
-        logits = mapping.logits.to(device)
         return KoemiOutput(
-            logits=logits,
+            logits=mapping.logits.to(device),
             state=state,
             surprise_values=mapping.surprise_values.to(device),
             expert_indices=mapping.expert_indices.to(device),
@@ -579,28 +559,18 @@ class KoemiModel(nn.Module):
             cache_hits=0,
             cache_misses=0,
             expert_count=self.settings.expert_count,
-            router_loss=logits.new_zeros(()),
         )
 
 
 def concatenate_outputs(windows: list[KoemiOutput]) -> KoemiOutput:
-    token_count = sum(window.token_count for window in windows)
     return KoemiOutput(
         logits=torch.cat([window.logits for window in windows], dim=1),
         state=windows[-1].state,
         surprise_values=torch.cat([window.surprise_values for window in windows], dim=1),
         expert_indices=torch.cat([window.expert_indices for window in windows], dim=1),
         valid_positions=torch.cat([window.valid_positions for window in windows], dim=1),
-        token_count=token_count,
+        token_count=sum(window.token_count for window in windows),
         cache_hits=sum(window.cache_hits for window in windows),
         cache_misses=sum(window.cache_misses for window in windows),
         expert_count=windows[0].expert_count,
-        router_loss=average_router_loss(windows, token_count),
     )
-
-
-def average_router_loss(windows: list[KoemiOutput], token_count: int) -> Tensor:
-    if token_count == 0:
-        return windows[0].router_loss
-    weighted = sum(window.router_loss * window.token_count for window in windows)
-    return weighted / token_count

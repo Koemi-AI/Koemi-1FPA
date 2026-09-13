@@ -2,7 +2,7 @@
 
 Koemi-2OBOV is a PyTorch training base for byte-level causal models built on
 HERM (Hierarchical Error-Refined Memory): bounded recurrent state, fast and
-slow associative memory, local exact recall and an optional expert bank.
+slow associative memory, local exact recall and optional deterministic experts.
 
 This repository contains architecture and training code. It does not ship a
 trained model and does not claim Transformer-level quality.
@@ -126,7 +126,7 @@ flowchart LR
     Slow --> Fusion
     Local --> Fusion
     Recurrent --> Fusion
-    Fusion --> MoE[Optional expert bank, hash or learned dispatch]
+    Fusion --> MoE[Optional contextual deterministic MoE]
     MoE --> Output[Linear byte predictor]
 ```
 
@@ -160,45 +160,12 @@ The previous recurrent state predicts the observed byte. Surprise is
 path. A carried `KoemiState` is the chain between generation steps; resetting it
 starts a new session.
 
-### Expert mixture
+### Contextual deterministic MoE
 
-`--expert-count` above zero adds a bank of gated feed-forward experts after the
-fused context. Two dispatch modes answer different questions.
-
-`--expert-routing hash` is the default and the original OBOV behaviour. A stable
-hash of current byte, previous byte and absolute position picks one expert. No
-gate, no routing loss, nothing that can collapse. It partitions contexts finely
-and cheaply, but a hash cannot specialise: the expert holding byte `a` holds it
-in every context it appears in.
-
-`--expert-routing learned` puts a linear gate on the fused context and sends each
-token to its `--expert-top-k` experts, weighted by the renormalised gate
-probability over the selected ones. `--expert-load-balance-weight` adds the
-Switch Transformer auxiliary term to the objective: the expert count times the
-sum over experts of dispatch fraction times mean gate probability. That term
-reads `1.0` on a uniform dispatch and rises to the expert count when routing
-collapses onto one expert, so the `router_loss=` field in the training log says
-directly how balanced the bank is. `--expert-router-jitter` multiplies the gate
-input by uniform noise, while training only.
-
-```bash
-.venv/bin/python -m koemi train \
-  --dataset examples/canonical.jsonl \
-  --checkpoint artifacts/koemi-moe.pt \
-  --expert-count 8 \
-  --expert-routing learned \
-  --expert-top-k 2 \
-  --expert-load-balance-weight 0.01 \
-  --overwrite
-```
-
-Dispatch is dropless: every token reaches every expert its gate selected, with no
-capacity factor and no silently dropped token. Capacity limits exist to bound the
-all-to-all of distributed MoE, and this trainer runs on one device.
-
-Tokens are sorted by expert once, gathered once, split into contiguous groups and
-scattered back with a single index operation. A wider bank therefore costs what
-its parameters cost, instead of paying for one Python-level call per expert.
+When `--expert-count` is greater than zero, a stable hash of current byte,
+previous byte and absolute position selects one expert. There is no risk head,
+top-k selector, routing projection or routing loss. This partitions contexts
+more finely than byte-only dispatch, but it is not learned semantic routing.
 
 ## Configuration
 
@@ -207,12 +174,7 @@ its parameters cost, instead of paying for one Python-level call per expert.
 | `--embedding-size` | `64` | Width of token embeddings and recurrent state. |
 | `--memory-features` | `16` | Width of associative memory features. |
 | `--local-memory-size` | `16` | Number of exact local key-value slots. |
-| `--expert-count` | `0` | Expert bank size; zero disables the bank. |
-| `--expert-routing` | `hash` | `hash` dispatch, or `learned` gate over the fused context. |
-| `--expert-top-k` | `1` | Experts per token; above one requires learned routing. |
-| `--expert-hidden-multiplier` | `2` | Expert hidden width as a multiple of the model width. |
-| `--expert-load-balance-weight` | `0.0` | Weight of the auxiliary balance term; learned routing only. |
-| `--expert-router-jitter` | `0.0` | Uniform noise on the gate input while training. |
+| `--expert-count` | `0` | Context-hash expert count; zero disables MoE. |
 | `--cache-capacity` | `256` | Maximum RAM token embeddings. |
 | `--scan-chunk` | `128` | Sequence bucket used by the parallel path. |
 | `--refine-decay-rate` | `0.0625` | Slow-memory timescale relative to fast decay. |
@@ -251,13 +213,8 @@ baseline; a small-budget single-seed run is not evidence of memory capacity.
 
 ## Known limitations
 
-- Hash dispatch is not semantic routing, and learned routing has no measured
-  quality result yet. The default stays hash because it cannot collapse and its
-  compute is predictable; `--expert-routing learned` is available and trains, but
-  nothing here shows it reaches lower bits per byte than the hash it replaces.
-- The auxiliary balance term is aggregated per scan window, so its value depends
-  on `--scan-chunk` and on the execution mode. Logits and expert assignments do
-  not: those still agree between the parallel scan and the sequential oracle.
+- Contextual deterministic experts are not learned semantic routing. Learned
+  expert selection would reintroduce a router, contrary to this architecture.
 - The disk cache reuses exact hashed sequences only; “similar question” reuse
   needs retrieval and a similarity contract outside this phase.
 - Disk entries contain recurrent state and logits and can encode prompt content.
@@ -281,7 +238,7 @@ baseline; a small-budget single-seed run is not evidence of memory capacity.
 src/koemi/
   configuration/  Model and training settings
   data/           JSON validation, adapters, serialization and tokenizer
-  model/          HERM state, memory, cache, scan and the expert bank
+  model/          HERM state, memory, cache, scan and deterministic MoE
   training/       Causal chunks, objective, trainer, checkpoint and generation
 benchmarks/       OBOV against parameter-matched GRU and LSTM baselines
 tests/            Data, model, cache, execution and training contracts

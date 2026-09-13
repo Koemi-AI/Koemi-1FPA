@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 
 import torch
 from torch import Tensor, nn
@@ -15,25 +14,6 @@ PREVIOUS_TOKEN_HASH_FACTOR = 97_409
 POSITION_HASH_FACTOR = 65_537
 UNASSIGNED_EXPERT = -1
 EXPERT_HIDDEN_MULTIPLIER = 2
-HASH_ROUTING = "hash"
-LEARNED_ROUTING = "learned"
-ROUTING_NAMES = (HASH_ROUTING, LEARNED_ROUTING)
-GATE_EPSILON = 1e-9
-
-
-@dataclass(frozen=True)
-class ExpertOutput:
-    context: Tensor
-    assignment: Tensor
-    load_balance: Tensor
-
-
-@dataclass(frozen=True)
-class RouterDecision:
-    expert_indices: Tensor
-    gate_weights: Tensor
-    primary_expert: Tensor
-    load_balance: Tensor
 
 
 class ExpertBank(nn.Module):
@@ -87,74 +67,16 @@ class ExpertBank(nn.Module):
         return outputs
 
 
-class ExpertRouter(nn.Module):
-    def __init__(self, width: int, expert_count: int, top_k: int, jitter: float) -> None:
+class DeterministicExpertMixture(nn.Module):
+    def __init__(self, embedding_size: int, expert_count: int) -> None:
         super().__init__()
-        if not 1 <= top_k <= expert_count:
-            raise ValueError("top_k must be between one and the expert count")
-        if jitter < 0.0:
-            raise ValueError("jitter must be non-negative")
         self.expert_count = expert_count
-        self.top_k = top_k
-        self.jitter = jitter
-        self.gate_projection = nn.Linear(width, expert_count, bias=False)
-
-    def forward(self, flat_context: Tensor, valid_flat: Tensor) -> RouterDecision:
-        gate_input = flat_context
-        if self.training and self.jitter > 0.0:
-            gate_input = gate_input * torch.empty_like(gate_input).uniform_(
-                1.0 - self.jitter, 1.0 + self.jitter
-            )
-        probabilities = torch.softmax(self.gate_projection(gate_input), dim=-1)
-        selected_weights, selected_indices = probabilities.topk(self.top_k, dim=-1)
-        gate_weights = selected_weights / selected_weights.sum(dim=-1, keepdim=True).clamp_min(GATE_EPSILON)
-        keep = valid_flat.unsqueeze(-1)
-        expert_indices = torch.where(
-            keep, selected_indices, torch.full_like(selected_indices, UNASSIGNED_EXPERT)
-        )
-        return RouterDecision(
-            expert_indices=expert_indices,
-            gate_weights=torch.where(keep, gate_weights, torch.zeros_like(gate_weights)),
-            primary_expert=expert_indices[:, 0],
-            load_balance=self.load_balance(probabilities, expert_indices, valid_flat),
-        )
-
-    def load_balance(self, probabilities: Tensor, expert_indices: Tensor, valid_flat: Tensor) -> Tensor:
-        valid_count = valid_flat.sum().to(probabilities.dtype).clamp_min(1.0)
-        importance = (probabilities * valid_flat.unsqueeze(-1)).sum(dim=0) / valid_count
-        occupancy = torch.bincount(
-            expert_indices.reshape(-1) + 1, minlength=self.expert_count + 1
-        )[1:]
-        fraction = occupancy.to(probabilities.dtype) / (valid_count * self.top_k)
-        return self.expert_count * (fraction * importance).sum()
-
-
-class ExpertMixture(nn.Module):
-    def __init__(
-        self,
-        embedding_size: int,
-        expert_count: int,
-        routing: str = HASH_ROUTING,
-        top_k: int = 1,
-        hidden_multiplier: int = EXPERT_HIDDEN_MULTIPLIER,
-        router_jitter: float = 0.0,
-    ) -> None:
-        super().__init__()
-        if routing not in ROUTING_NAMES:
-            raise ValueError(f"routing must be one of {ROUTING_NAMES}")
-        self.expert_count = expert_count
-        self.routing = routing
-        self.top_k = top_k if expert_count > 0 else 1
         if expert_count > 0:
-            self.expert_bank = ExpertBank(expert_count, embedding_size, hidden_multiplier)
+            self.expert_bank = ExpertBank(expert_count, embedding_size, EXPERT_HIDDEN_MULTIPLIER)
             self.output_normalizer = RootMeanSquareNorm(embedding_size)
         else:
             self.register_module("expert_bank", None)
             self.register_module("output_normalizer", None)
-        if expert_count > 0 and routing == LEARNED_ROUTING:
-            self.router = ExpertRouter(embedding_size, expert_count, self.top_k, router_jitter)
-        else:
-            self.register_module("router", None)
 
     def forward(
         self,
@@ -163,30 +85,11 @@ class ExpertMixture(nn.Module):
         previous_token_ids: Tensor,
         positions: Tensor,
         valid_mask: Tensor,
-    ) -> ExpertOutput:
+    ) -> tuple[Tensor, Tensor]:
         if self.expert_count == 0:
-            return ExpertOutput(
-                context=context,
-                assignment=torch.full_like(token_ids, UNASSIGNED_EXPERT),
-                load_balance=context.new_zeros(()),
-            )
-        flat_context = context.reshape(-1, context.shape[-1])
-        valid_flat = valid_mask.reshape(-1)
-        if self.router is None:
-            assignment = self.assign(token_ids, previous_token_ids, positions, valid_mask)
-            mixed = self.combine(flat_context, assignment.reshape(-1, 1), None, valid_flat)
-            return ExpertOutput(
-                context=mixed.reshape_as(context),
-                assignment=assignment,
-                load_balance=context.new_zeros(()),
-            )
-        decision = self.router(flat_context, valid_flat)
-        mixed = self.combine(flat_context, decision.expert_indices, decision.gate_weights, valid_flat)
-        return ExpertOutput(
-            context=mixed.reshape_as(context),
-            assignment=decision.primary_expert.reshape_as(token_ids),
-            load_balance=decision.load_balance,
-        )
+            return context, torch.full_like(token_ids, UNASSIGNED_EXPERT)
+        assignment = self.assign(token_ids, previous_token_ids, positions, valid_mask)
+        return self.dispatch(context, assignment, valid_mask), assignment
 
     def assign(
         self,
@@ -204,37 +107,14 @@ class ExpertMixture(nn.Module):
 
     def dispatch(self, context: Tensor, assignment: Tensor, valid_mask: Tensor) -> Tensor:
         flat_context = context.reshape(-1, context.shape[-1])
-        mixed = self.combine(flat_context, assignment.reshape(-1, 1), None, valid_mask.reshape(-1))
-        return mixed.reshape_as(context)
-
-    def combine(
-        self,
-        flat_context: Tensor,
-        expert_indices: Tensor,
-        gate_weights: Tensor | None,
-        valid_flat: Tensor,
-    ) -> Tensor:
-        top_k = expert_indices.shape[1]
-        pair_expert = expert_indices.reshape(-1)
-        order = torch.argsort(pair_expert, stable=True)
-        occupancy = torch.bincount(pair_expert + 1, minlength=self.expert_count + 1).tolist()
+        flat_assignment = assignment.reshape(-1)
+        order = torch.argsort(flat_assignment, stable=True)
+        occupancy = torch.bincount(flat_assignment + 1, minlength=self.expert_count + 1).tolist()
+        unassigned_count = occupancy[0]
         group_sizes = occupancy[1:]
-        dispatched_pairs = order.narrow(0, occupancy[0], sum(group_sizes))
-        rows = (
-            dispatched_pairs
-            if top_k == 1
-            else dispatched_pairs.div(top_k, rounding_mode="floor")
-        )
-        groups = torch.split(flat_context.index_select(0, rows), group_sizes)
+        dispatched_rows = order.narrow(0, unassigned_count, sum(group_sizes))
+        groups = torch.split(flat_context.index_select(0, dispatched_rows), group_sizes)
         dispatched_output = torch.cat(self.expert_bank.apply_groups(groups))
-        if gate_weights is not None:
-            pair_weights = gate_weights.reshape(-1).index_select(0, dispatched_pairs)
-            dispatched_output = dispatched_output * pair_weights.unsqueeze(-1)
-        empty_delta = torch.zeros_like(flat_context)
-        delta = (
-            empty_delta.index_copy(0, rows, dispatched_output)
-            if top_k == 1
-            else empty_delta.index_add(0, rows, dispatched_output)
-        )
+        delta = torch.zeros_like(flat_context).index_copy(0, dispatched_rows, dispatched_output)
         mixed = self.output_normalizer(flat_context + delta)
-        return torch.where(valid_flat.unsqueeze(-1), mixed, flat_context)
+        return torch.where(valid_mask.reshape(-1, 1), mixed, flat_context).reshape_as(context)

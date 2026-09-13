@@ -44,7 +44,7 @@ flowchart LR
     M --> Fuse
     SLOW --> Fuse
     L --> Fuse
-    Fuse --> E[Optional expert bank, hash or learned dispatch]
+    Fuse --> E[Optional fixed expert e = token mod E]
     E --> Head[Byte logits]
     Disk[Optional SSD mapping cache] -. exact hash hit .-> Head
 ```
@@ -126,7 +126,7 @@ The oldest pair is discarded after the current token is processed. Cost is
 `O(Wd)` per token and state storage is bounded by `O(Wd)`. Padding entries are
 never considered valid pairs.
 
-### 5. Fusion and the expert bank
+### 5. Fusion and fixed-dispatch MoE
 
 The three states are concatenated into one typed context:
 
@@ -134,51 +134,17 @@ The three states are concatenated into one typed context:
 z_t = RMSNorm(W_z [h_t || m_t || l_t] + b_z)
 ```
 
-When `expert_count = E > 0` the context passes through a bank of E gated
-feed-forward experts. Two dispatch modes exist.
-
-Hash dispatch, `expert_routing = "hash"`, is the default and carries no routing
-parameter at all:
+When `expert_count = E > 0`, dispatch is fixed and deterministic:
 
 ```text
 e_t = hash(token_id_t, token_id_(t-1), position_t) mod E
 y_t = RMSNorm(z_t + FFN_e_t(z_t))
 ```
 
-Learned dispatch, `expert_routing = "learned"`, adds one linear gate and sends
-each token to its top `k = expert_top_k` experts:
-
-```text
-p_t = softmax(W_g z_t)
-S_t = topk(p_t, k)
-g_t,e = p_t,e / sum_(j in S_t) p_t,j
-y_t = RMSNorm(z_t + sum_(e in S_t) g_t,e FFN_e(z_t))
-```
-
-The auxiliary balance term follows Switch Transformer. With `f_e` the fraction of
-dispatch slots that landed on expert `e` and `P_e` the mean gate probability of
-`e` over valid tokens:
-
-```text
-balance = E * sum_e f_e * P_e
-```
-
-It equals `1.0` under a uniform dispatch and `E` when every token selects the
-same expert, and it enters the objective scaled by
-`expert_load_balance_weight`. The fraction carries no gradient, so the pressure
-reaches the gate through `P_e`, as in the original formulation.
-
-Dispatch is dropless in both modes: every selected pair is computed, with no
-capacity factor and no dropped token. Execution sorts tokens by expert once,
-gathers once, splits into contiguous groups, and scatters back with one index
-operation; the bank exposes its stacked weights through `unbind`, so each
-parameter enters the autograd graph once rather than once per expert.
-`expert_count = 0` skips the bank entirely and allocates none of its parameters.
-
-The balance term is reduced over the tokens of one scan window, so its value
-depends on `scan_chunk` and on the execution mode. Logits, states and expert
-assignments do not: those remain identical between the parallel scan and the
-sequential oracle.
+Exactly one expert processes each valid token. There is no routing projection,
+risk head, top-k selector, soft mixture or routing loss. This is a deliberate
+trade-off: KSM has a predictable sparse expert bank, not learned semantic MoE
+dispatch. `expert_count = 0` skips the bank entirely.
 
 ### 6. Causal prediction
 
@@ -200,7 +166,7 @@ thinking span and output span in order. The dataset propagates two masks:
 The objective reports ordinary task loss and thinking loss separately. A
 `thinking_loss_weight` of `1.0` leaves the ordinary average unchanged. Other
 non-negative values change the contribution of thinking positions. This makes
-thinking and the expert bank composable without representing visible traces
+thinking and fixed-dispatch MoE composable without representing visible traces
 as a hidden cognition claim.
 
 ## Cache tiers and chains
@@ -258,8 +224,7 @@ must be measured by the OBOV benchmark.
 | Hierarchical fast/slow associative memory | `model/memory.py` | implemented |
 | Surprise write scaling | `model/network.py` | implemented |
 | Exact local ring with validity | `model/memory.py` | implemented |
-| Hash-dispatch expert bank | `model/experts.py` | implemented |
-| Learned top-k routing with balance term | `model/experts.py` | implemented, quality unmeasured |
+| Fixed-dispatch MoE | `model/experts.py` | implemented |
 | Thinking mask and weighted loss | `training/dataset.py`, `training/objective.py` | implemented |
 | RAM warm embedding cache | `model/cache.py` | implemented |
 | Optional SSD exact mapping cache | `model/cache.py` | implemented |
@@ -274,7 +239,7 @@ must be measured by the OBOV benchmark.
 - OBOV versus GRU, LSTM, Mamba-2, Gated DeltaNet and a Transformer at matched
   tokenizer, parameter count, token budget, precision and device;
 - p50/p95 training and decode throughput, peak VRAM/RAM and state bytes;
-- ablations for `expert_count`, `expert_routing`, local window, memory feature width and cache
+- ablations for `expert_count`, local window, memory feature width and cache
   hit rate;
 - cache invalidation, corruption, retention and cross-session isolation tests;
 - NaN/Inf, state norm, surprise distribution and write-rate reports.

@@ -106,11 +106,6 @@ def add_model_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--memory-features", type=int, default=16)
     parser.add_argument("--local-memory-size", type=int, default=16)
     parser.add_argument("--expert-count", type=int, default=0)
-    parser.add_argument("--expert-routing", choices=("hash", "learned"), default="hash")
-    parser.add_argument("--expert-top-k", type=int, default=1)
-    parser.add_argument("--expert-hidden-multiplier", type=int, default=2)
-    parser.add_argument("--expert-load-balance-weight", type=float, default=0.0)
-    parser.add_argument("--expert-router-jitter", type=float, default=0.0)
     parser.add_argument("--cache-capacity", type=int, default=256)
     parser.add_argument("--scan-chunk", type=int, default=128)
     parser.add_argument("--refine-decay-rate", type=float, default=0.0625)
@@ -183,14 +178,13 @@ def train_model(arguments: argparse.Namespace, logger) -> int:
     checkpoint_path = CheckpointStore().save(arguments.checkpoint, model, overwrite=arguments.overwrite)
     logger.info(
         "training_completed checkpoint=%s mean_loss=%.6f task_loss=%.6f thinking_loss=%.6f "
-        "router_loss=%.6f mean_surprise=%.4f validation_loss=%s validation_perplexity=%s optimizer_steps=%s "
+        "mean_surprise=%.4f validation_loss=%s validation_perplexity=%s optimizer_steps=%s "
         "tokens_per_second=%.2f final_learning_rate=%.8f precision=%s supervised_tokens=%s tokens=%s "
         "expert_activations=%s elapsed_seconds=%.3f",
         checkpoint_path,
         result.mean_loss,
         result.mean_task_loss,
         result.mean_thinking_loss,
-        result.mean_router_loss,
         result.mean_surprise,
         result.validation_loss,
         result.validation_perplexity,
@@ -308,11 +302,6 @@ def create_model_settings(arguments: argparse.Namespace) -> ModelSettings:
         memory_features=arguments.memory_features,
         local_memory_size=arguments.local_memory_size,
         expert_count=arguments.expert_count,
-        expert_routing=arguments.expert_routing,
-        expert_top_k=arguments.expert_top_k,
-        expert_hidden_multiplier=arguments.expert_hidden_multiplier,
-        expert_load_balance_weight=arguments.expert_load_balance_weight,
-        expert_router_jitter=arguments.expert_router_jitter,
         cache_capacity=arguments.cache_capacity,
         scan_chunk=arguments.scan_chunk,
         refine_decay_rate=arguments.refine_decay_rate,
